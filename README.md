@@ -699,9 +699,7 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
   was run), nor machines with a very different core count or much less
   memory (the images are memory-mapped, so a laptop with 8 GB of RAM should
   cope with the 1.47 GB tile, but I have not measured it).
-- **No continuous integration, no pre-built packages.** The tests are run by
-  hand. The workflow file in `euclidrust/.github/` is not at the root of the
-  repository, so GitHub never runs it. The package is not on PyPI: you build
+- **No continuous integration, no pre-built packages.** The tests are run by hand (there is no CI workflow). The package is not on PyPI: you build
   it yourself, which needs a Rust toolchain. The interface is version 0.1.0
   and may change.
 
