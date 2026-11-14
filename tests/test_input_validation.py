@@ -110,6 +110,52 @@ def test_int64_exact(tmp):
     assert euclid_fast.fits_stats(p2).min_int is None and cutout(p2).data_int is None
 
 
+def test_int64_exact_more(tmp):
+    # 1. whole-number BSCALE / BZERO (negative ones too) are applied in integers
+    rng = np.random.default_rng(4)
+    raw = rng.integers(-2**62, 2**62, (40, 60), dtype=np.int64)
+    raw[0, 0] = 2**62 + 1
+    for k, (bscale, bzero) in enumerate(((2, 0), (3, 7), (-1, 100), (-5, -2**63), (1, 2**63))):
+        h = fits.PrimaryHDU(raw); h.header["BSCALE"] = bscale; h.header["BZERO"] = bzero
+        s = euclid_fast.fits_stats(write(tmp, f"aff{k}.fits", fits.HDUList([h])))
+        phys = [bzero + bscale * int(v) for v in raw.ravel()]
+        assert (s.min_int, s.max_int) == (min(phys), max(phys)), (bscale, bzero)
+        assert abs(s.mean - sum(phys) / len(phys)) <= 1e-12 * max(1.0, abs(sum(phys) / len(phys)))
+    for k, (bscale, bzero) in enumerate(((0.5, 0), (1, 0.5))):      # not whole numbers: float64 only
+        h = fits.PrimaryHDU(raw); h.header["BSCALE"] = bscale; h.header["BZERO"] = bzero
+        assert euclid_fast.fits_stats(write(tmp, f"frac{k}.fits", fits.HDUList([h]))).min_int is None
+
+    # 2. tile-compressed 64-bit images (cfitsio only allows gzip for them)
+    lab = np.arange(60 * 80, dtype=np.int64).reshape(60, 80) * 7919 + 2**60 + 1
+    u = np.arange(60 * 80, dtype=np.uint64).reshape(60, 80) * np.uint64(1000003) + np.uint64(2**63) + np.uint64(5)
+    hdr = fits.Header(); add_wcs(hdr); hdr["CRPIX1"], hdr["CRPIX2"] = 40, 30
+    cases = [(lab, algo, kw) for algo in ("GZIP_1", "GZIP_2") for kw in ({}, {"tile_shape": (16, 24)})] + [(u, "GZIP_2", {})]
+    for k, (arr, algo, kw) in enumerate(cases):
+        p = write(tmp, f"c64_{k}.fits", fits.HDUList([fits.PrimaryHDU(), fits.CompImageHDU(arr, header=hdr, compression_type=algo, **kw)]))
+        assert euclid_fast.list_hdus(p)[1].readable
+        s = euclid_fast.fits_stats(p, hdu=1)
+        assert (s.min_int, s.max_int) == (int(arr.min()), int(arr.max())), (algo, kw)
+        c = euclid_fast.extract_cutout(p, RA, DEC, 6, 4, hdu=1)
+        x0, y0 = int(round(c.pixel_x_center - 1 - 3)), int(round(c.pixel_y_center - 1 - 2))
+        assert c.data_int == [int(v) for v in arr[y0:y0 + 4, x0:x0 + 6].ravel()], (algo, kw)
+
+    # 3. the Parquet export keeps the exact integers
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        return
+    for k, (arr, kind) in enumerate(((lab, "int64"), (u, "uint64"), (IMG.astype(np.int16), "double"), (IMG, "double"))):
+        h = fits.PrimaryHDU(arr); add_wcs(h.header)
+        h.header["CRPIX1"], h.header["CRPIX2"] = arr.shape[1] / 2, arr.shape[0] / 2     # sky position at the image center
+        p = write(tmp, f"pq{k}.fits", fits.HDUList([h]))
+        out = str(Path(tmp) / f"pq{k}.parquet")
+        euclid_fast.export_cutout_parquet(p, RA, DEC, 6, 4, out)
+        col = pq.read_table(out).column("value")
+        c = euclid_fast.extract_cutout(p, RA, DEC, 6, 4)
+        assert str(col.type) == kind, (kind, col.type)
+        assert col.to_pylist() == (c.data_int if c.data_int is not None else c.data)
+
+
 def test_extensions(tmp):
     # Layout of Euclid calibrated frames: empty primary, one image per extension.
     sci = fits.ImageHDU(IMG, name="DET11.SCI"); add_wcs(sci.header)
@@ -444,7 +490,7 @@ def test_batch(tmp):
 
 def test_all():
     for fn in (test_supported_primary, test_int64, test_extensions, test_unreadable_hdus,
-               test_int64_exact, test_rejected_inputs, test_tpv_matches_astropy, test_wcs_matches_astropy,
+               test_int64_exact, test_int64_exact_more, test_rejected_inputs, test_tpv_matches_astropy, test_wcs_matches_astropy,
                test_compressed_images, test_batch):
         with tempfile.TemporaryDirectory() as tmp:
             fn(tmp)

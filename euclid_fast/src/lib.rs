@@ -1038,6 +1038,42 @@ fn decode_tile(t: &Tiled, mmap: &[u8], tile_index: usize) -> PyResult<Vec<f64>> 
     err(format!("tile {tile_index} has no data in any of the table's data columns"))
 }
 
+/// Raw values of one tile of a 64-bit integer image. Only gzip can compress
+/// those (cfitsio has no Rice / HCOMPRESS / PLIO for 64 bits).
+fn decode_tile_i64(t: &Tiled, mmap: &[u8], tile_index: usize) -> PyResult<Vec<i64>> {
+    let ntx = t.naxis1.div_ceil(t.tile1);
+    let (tx, ty) = (tile_index % ntx, tile_index / ntx);
+    let n = t.tile1.min(t.naxis1 - tx * t.tile1) * t.tile2.min(t.naxis2 - ty * t.tile2);
+    let nonempty = |c: &Option<Column>| -> PyResult<Option<&[u8]>> {
+        match c {
+            Some(col) => Ok(Some(heap_bytes(t, mmap, col, tile_index)?).filter(|b| !b.is_empty())),
+            None => Ok(None),
+        }
+    };
+    let parse = |buf: &[u8]| -> PyResult<Vec<i64>> {
+        if buf.len() < n * 8 {
+            return err("corrupt tile: fewer bytes than the tile size implies");
+        }
+        Ok(buf.chunks_exact(8).take(n).map(|b| i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])).collect())
+    };
+    for column in [&t.comp, &t.gzip] {
+        if let Some(bytes) = nonempty(column)? {
+            if t.algo == Algo::Rice {
+                return err("a Rice-compressed 64-bit integer tile cannot be decoded (the format does not allow it)");
+            }
+            let mut buf = gunzip(bytes, n * 8)?;
+            if t.algo == Algo::Gzip2 {
+                buf = unshuffle(&buf, n, 8);
+            }
+            return parse(&buf);
+        }
+    }
+    if let Some(bytes) = nonempty(&t.uncomp)? {
+        return parse(bytes);
+    }
+    err(format!("tile {tile_index} has no data in any of the table's data columns"))
+}
+
 /// Finds the requested HDU, checks that it is a plain 2-D image (raw or
 /// tile-compressed) and returns what is needed to read its pixels. With
 /// `hdu=None` the primary HDU is used.
@@ -1282,11 +1318,24 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
 
     let mut exact: Option<(i128, i128)> = None;
     let (min, max, sum) = if let Some(t) = &header.tiled {
-        let parts: Vec<(f64, f64, f64)> = (0..t.nrows)
-            .into_par_iter()
-            .map(|i| decode_tile(t, &mmap, i).map(|v| reduce_f64(&v)))
-            .collect::<PyResult<Vec<_>>>()?;
-        parts.into_iter().fold((f64::INFINITY, f64::NEG_INFINITY, 0.0), |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 + b.2))
+        let affine = if t.zbitpix == 64 { int64_affine(header.bzero, header.bscale) } else { None };
+        if let Some(affine) = affine {
+            // 64-bit integer image (only gzip can compress those): exact arithmetic
+            let parts: Vec<(i64, i64, i128)> = (0..t.nrows)
+                .into_par_iter()
+                .map(|i| decode_tile_i64(t, &mmap, i).map(|v| reduce_i64_slice(&v)))
+                .collect::<PyResult<Vec<_>>>()?;
+            let raw = parts.into_iter().fold((i64::MAX, i64::MIN, 0i128), |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 + b.2));
+            let (mn, mx, sm) = affine_stats(raw, n_pixels as i128, affine);
+            exact = Some((mn, mx));
+            (mn as f64, mx as f64, sm as f64)
+        } else {
+            let parts: Vec<(f64, f64, f64)> = (0..t.nrows)
+                .into_par_iter()
+                .map(|i| decode_tile(t, &mmap, i).map(|v| reduce_f64(&v)))
+                .collect::<PyResult<Vec<_>>>()?;
+            parts.into_iter().fold((f64::INFINITY, f64::NEG_INFINITY, 0.0), |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 + b.2))
+        }
     } else {
         let bytes_per_pixel = (header.bitpix.unsigned_abs() as usize) / 8;
         let data_end = header.data_offset + n_pixels * bytes_per_pixel;
@@ -1302,11 +1351,11 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
             16 => reduce_be::<i16>(data, header.bzero, header.bscale),
             8 => reduce_be::<u8>(data, header.bzero, header.bscale),
             32 => reduce_be::<i32>(data, header.bzero, header.bscale),
-            64 => match int64_offset(header.bzero, header.bscale) {
-                // Exact integer arithmetic: BZERO is added as an integer, so unsigned
-                // 64-bit data (BZERO = 2^63) and values above 2^53 stay exact.
-                Some(offset) => {
-                    let (mn, mx, sm) = reduce_i64_exact(data, offset);
+            64 => match int64_affine(header.bzero, header.bscale) {
+                // Exact integer arithmetic: BZERO and BSCALE are applied as integers, so
+                // unsigned 64-bit data (BZERO = 2^63) and values above 2^53 stay exact.
+                Some(affine) => {
+                    let (mn, mx, sm) = affine_stats(reduce_i64_raw(data), (data.len() / 8) as i128, affine);
                     exact = Some((mn, mx));
                     (mn as f64, mx as f64, sm as f64)
                 }
@@ -1369,6 +1418,10 @@ struct HduStats {
     max: f64,
     #[pyo3(get)]
     mean: f64,
+    #[pyo3(get)]
+    min_int: Option<i128>,
+    #[pyo3(get)]
+    max_int: Option<i128>,
     #[pyo3(get)]
     elapsed_ms: f64,
 }
@@ -1449,6 +1502,8 @@ fn fits_stats_all_hdus(
                     min: s.min,
                     max: s.max,
                     mean: s.mean,
+                    min_int: s.min_int,
+                    max_int: s.max_int,
                     elapsed_ms: s.elapsed_ms,
                 })
             })
@@ -1537,24 +1592,34 @@ fn reduce_be<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) ->
         )
 }
 
-/// The integer value of BZERO if the physical value of a 64-bit integer pixel is
-/// simply `raw + BZERO` (BSCALE = 1, BZERO a whole number): then everything can
-/// be computed exactly in integers. This covers signed 64-bit images (BZERO = 0)
-/// and unsigned ones, which FITS stores as signed with BZERO = 2^63.
-fn int64_offset(bzero: f64, bscale: f64) -> Option<i128> {
-    if bscale == 1.0 && bzero.fract() == 0.0 && bzero.abs() < 1e30 {
-        Some(bzero as i128)
+/// BZERO and BSCALE as whole numbers, when the physical value of a 64-bit integer
+/// pixel, `BZERO + BSCALE * raw`, can then be computed exactly in integers. This
+/// covers signed 64-bit images (BZERO = 0, BSCALE = 1) and unsigned ones, which
+/// FITS stores as signed with BZERO = 2^63. The bounds keep every intermediate
+/// result (including sums over 2^40 pixels) inside 128 bits.
+fn int64_affine(bzero: f64, bscale: f64) -> Option<(i128, i128)> {
+    let whole = |x: f64| x.fract() == 0.0;
+    if whole(bzero) && whole(bscale) && bscale != 0.0 && bzero.abs() <= 18446744073709551616.0 && bscale.abs() <= 1048576.0 {
+        Some((bzero as i128, bscale as i128))
     } else {
         None
     }
 }
 
-/// Exact (min, max, sum) of the physical values (raw + offset) of big-endian
-/// 64-bit integers, in 128-bit integer arithmetic, in parallel.
-fn reduce_i64_exact(data: &[u8], offset: i128) -> (i128, i128, i128) {
-    let n = (data.len() / 8) as i128;
-    let (mn, mx, sum) = data
-        .par_chunks(8 << 16)
+/// (min, max, sum) of a slice of raw 64-bit integers; the sum is exact.
+fn reduce_i64_slice(v: &[i64]) -> (i64, i64, i128) {
+    let (mut mn, mut mx, mut sum) = (i64::MAX, i64::MIN, 0i128);
+    for &x in v {
+        mn = mn.min(x);
+        mx = mx.max(x);
+        sum += x as i128;
+    }
+    (mn, mx, sum)
+}
+
+/// Raw (min, max, sum) of big-endian 64-bit integers, in parallel.
+fn reduce_i64_raw(data: &[u8]) -> (i64, i64, i128) {
+    data.par_chunks(8 << 16)
         .map(|chunk| {
             let (mut mn, mut mx, mut sum) = (i64::MAX, i64::MIN, 0i128);
             for b in chunk.chunks_exact(8) {
@@ -1563,10 +1628,16 @@ fn reduce_i64_exact(data: &[u8], offset: i128) -> (i128, i128, i128) {
                 mx = mx.max(v);
                 sum += v as i128;
             }
-            (mn as i128, mx as i128, sum)
+            (mn, mx, sum)
         })
-        .reduce(|| (i128::MAX, i128::MIN, 0i128), |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 + b.2));
-    (mn + offset, mx + offset, sum + offset * n)
+        .reduce(|| (i64::MAX, i64::MIN, 0i128), |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 + b.2))
+}
+
+/// Exact physical (min, max, sum) from the raw reduction of `n` pixels:
+/// each value is `bzero + bscale * raw` (a negative BSCALE swaps min and max).
+fn affine_stats(raw: (i64, i64, i128), n: i128, (bzero, bscale): (i128, i128)) -> (i128, i128, i128) {
+    let (a, b) = (bzero + bscale * raw.0 as i128, bzero + bscale * raw.1 as i128);
+    (a.min(b), a.max(b), bzero * n + bscale * raw.2)
 }
 
 /// The (powers of x, powers of y, powers of r) of each of the 40 TPV terms,
@@ -1890,6 +1961,34 @@ fn cutout_at(
         let (ty_lo, ty_hi) = (y0 / t.tile2, (y0 + height - 1) / t.tile2);
         let wanted: Vec<(usize, usize)> =
             (ty_lo..=ty_hi).flat_map(|ty| (tx_lo..=tx_hi).map(move |tx| (tx, ty))).collect();
+        let affine = if t.zbitpix == 64 { int64_affine(header.bzero, header.bscale) } else { None };
+        if let Some((bz, bs)) = affine {
+            // 64-bit integer image: keep the exact integers
+            let decoded: Vec<Vec<i64>> = wanted
+                .par_iter()
+                .map(|&(tx, ty)| decode_tile_i64(t, mmap, ty * ntx + tx))
+                .collect::<PyResult<Vec<_>>>()?;
+            let mut ints = vec![0i128; width * height];
+            for (&(tx, ty), tile) in wanted.iter().zip(decoded.iter()) {
+                let (tile_x0, tile_y0) = (tx * t.tile1, ty * t.tile2);
+                let tile_w = t.tile1.min(t.naxis1 - tile_x0);
+                for row in 0..height {
+                    let y = y0 + row;
+                    if y < tile_y0 || y >= tile_y0 + t.tile2.min(t.naxis2 - tile_y0) {
+                        continue;
+                    }
+                    for col in 0..width {
+                        let x = x0 + col;
+                        if x < tile_x0 || x >= tile_x0 + tile_w {
+                            continue;
+                        }
+                        ints[row * width + col] = bz + bs * tile[(y - tile_y0) * tile_w + (x - tile_x0)] as i128;
+                    }
+                }
+            }
+            let data: Vec<f64> = ints.iter().map(|&v| v as f64).collect();
+            return Ok((px, py, x0, y0, data, Some(ints)));
+        }
         let decoded: Vec<Vec<f64>> = wanted
             .par_iter()
             .map(|&(tx, ty)| decode_tile(t, mmap, ty * ntx + tx))
@@ -1925,16 +2024,16 @@ fn cutout_at(
 
     let mut data = Vec::with_capacity(width * height);
     // 64-bit integers are read exactly (BZERO = 2^63 is how FITS stores uint64).
-    let exact_offset = if header.bitpix == 64 { int64_offset(header.bzero, header.bscale) } else { None };
-    let mut data_int: Option<Vec<i128>> = exact_offset.map(|_| Vec::with_capacity(width * height));
+    let exact_affine = if header.bitpix == 64 { int64_affine(header.bzero, header.bscale) } else { None };
+    let mut data_int: Option<Vec<i128>> = exact_affine.map(|_| Vec::with_capacity(width * height));
     for row in 0..height {
         let row_offset = header.data_offset + (y0 + row) * row_stride + x0 * bytes_per_pixel;
         let row_bytes = &mmap[row_offset..row_offset + width * bytes_per_pixel];
         for col in 0..width {
             let off = col * bytes_per_pixel;
             let raw = &row_bytes[off..off + bytes_per_pixel];
-            if let (Some(offset), Some(ints)) = (exact_offset, data_int.as_mut()) {
-                let value = i64::from_be_bytes([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]]) as i128 + offset;
+            if let (Some((bz, bs)), Some(ints)) = (exact_affine, data_int.as_mut()) {
+                let value = bz + bs * i64::from_be_bytes([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]]) as i128;
                 ints.push(value);
                 data.push(value as f64);
                 continue;
@@ -2077,7 +2176,7 @@ fn export_cutout_parquet(
     hdu: Option<HduSelector>,
 ) -> PyResult<ParquetExport> {
     let start = std::time::Instant::now();
-    let (_px, _py, x0, y0, data, _) =
+    let (_px, _py, x0, y0, data, data_int) =
         python.detach(|| extract_cutout_raw(path, ra_deg, dec_deg, width, height, &hdu))?;
 
     let n = data.len();
@@ -2092,7 +2191,17 @@ fn export_cutout_parquet(
 
     let x_arr: arrow_array::ArrayRef = std::sync::Arc::new(arrow_array::Int64Array::from(xs));
     let y_arr: arrow_array::ArrayRef = std::sync::Arc::new(arrow_array::Int64Array::from(ys));
-    let v_arr: arrow_array::ArrayRef = std::sync::Arc::new(arrow_array::Float64Array::from(data));
+    // 64-bit integer images keep their exact values: an Int64 column when they fit
+    // (signed data), else UInt64 (unsigned data); anything else is Float64.
+    let v_arr: arrow_array::ArrayRef = match &data_int {
+        Some(ints) if ints.iter().all(|&v| v >= i64::MIN as i128 && v <= i64::MAX as i128) => {
+            std::sync::Arc::new(arrow_array::Int64Array::from(ints.iter().map(|&v| v as i64).collect::<Vec<_>>()))
+        }
+        Some(ints) if ints.iter().all(|&v| v >= 0 && v <= u64::MAX as i128) => {
+            std::sync::Arc::new(arrow_array::UInt64Array::from(ints.iter().map(|&v| v as u64).collect::<Vec<_>>()))
+        }
+        _ => std::sync::Arc::new(arrow_array::Float64Array::from(data)),
+    };
 
     let batch = arrow_array::RecordBatch::try_from_iter([("x", x_arr), ("y", y_arr), ("value", v_arr)])
         .map_err(|e| PyValueError::new_err(format!("failed to build the RecordBatch: {e}")))?;

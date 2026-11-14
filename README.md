@@ -60,7 +60,7 @@ contains.
 |---|---|
 | An image HDU | 2-D (`NAXIS = 2`). The primary HDU by default, or any image extension through `hdu=` (0-based index or `EXTNAME`) |
 | Compression | None, or FITS tile compression with `RICE_1`, `GZIP_1` or `GZIP_2` (the `.fits.fz` format written by `fpack` and by astropy's `CompImageHDU`), including quantized floating-point images (`NO_DITHER`, `SUBTRACTIVE_DITHER_1`, `SUBTRACTIVE_DITHER_2`). A compressed image always lives in an extension, so pass `hdu=1` (or its name) |
-| Pixel type (`BITPIX`) | `8`, `16`, `32`, `64` (integers), `-32`, `-64` (floating point). `BZERO` / `BSCALE` are applied, so unsigned 16-bit raw data (`BZERO = 32768`) works. 64-bit integers, signed or unsigned (FITS stores unsigned 64-bit as signed with `BZERO = 2^63`), are handled **exactly**: the exact values are in `min_int` / `max_int` (`fits_stats`) and `data_int` (`extract_cutout`), as Python ints; the ordinary float fields hold the nearest `float64` |
+| Pixel type (`BITPIX`) | `8`, `16`, `32`, `64` (integers), `-32`, `-64` (floating point). `BZERO` / `BSCALE` are applied, so unsigned 16-bit raw data (`BZERO = 32768`) works. 64-bit integers, signed or unsigned (FITS stores unsigned 64-bit as signed with `BZERO = 2^63`), are handled **exactly**, in raw and in gzip-compressed images (cfitsio compresses 64-bit integers with gzip only), including a whole-number `BSCALE` / `BZERO`: the exact values are in `min_int` / `max_int` (`fits_stats`) and `data_int` (`extract_cutout`), as Python ints, and the Parquet `value` column is `Int64` / `UInt64`; the ordinary float fields hold the nearest `float64` |
 | WCS, only needed for cutouts | `CTYPE1/2` = `RA---xxx` / `DEC--xxx` with `xxx` one of `TAN`, `SIN`, `ARC`, `STG`, `ZEA`, `ZPN` (the zenithal projections), `TAN-SIP` (tangent plus the SIP polynomial distortion) or `TPV` (tangent plus the `PV1_m` / `PV2_m` polynomials used by the Euclid VIS pipeline), together with `CRVAL1/2`, `CRPIX1/2` and a linear matrix written as `CD` (`CD1_1`, `CD1_2`, `CD2_1`, `CD2_2`), as `CDELT1/2` with an optional `PC` matrix, or as `CDELT1/2` with the legacy `CROTA2`. `LONPOLE` is honoured. `fits_stats` needs no WCS |
 
 **Not supported.** Anything else is rejected with a `ValueError` that says
@@ -197,7 +197,8 @@ You need three things on your machine:
 Everything else (maturin, PyO3 and the other Rust libraries) is downloaded
 automatically during the build, so the first install needs internet access.
 
-> Tested on Debian 13 (x86_64) with Python 3.13 and Rust 1.100. macOS and
+> Tested on Debian 13 (x86_64) with Python 3.13 and Rust 1.100, on an Intel Core
+> i7-8559U (4 cores / 8 threads) with 31 GiB of RAM. macOS and
 > Windows have not been tested; if you try them, please open an issue with
 > what happened.
 
@@ -296,7 +297,7 @@ Reference:
 | `extract_cutout(path, ra_deg, dec_deg, width, height, hdu=None)` | `Cutout` | `data` (flat list of floats, row-major), `data_int` (the same pixels as exact Python ints for 64-bit integer images, otherwise `None`), `width`, `height`, `pixel_x_center`, `pixel_y_center`, `elapsed_ms` |
 | `export_cutout_parquet(path, ra_deg, dec_deg, width, height, out_path, hdu=None)` | `ParquetExport` | `out_path`, `rows`, `elapsed_ms` |
 | `fits_stats_many(paths, hdu=None, skip_errors=False)` | list of `FitsStats` (or `None`) | one per file, in the same order; see [Many images at once](#many-images-at-once) |
-| `fits_stats_all_hdus(path, name_contains=None)` | list of `HduStats` | per image HDU: `index`, `name`, `naxis1`, `naxis2`, `bitpix`, `min`, `max`, `mean`, `elapsed_ms` |
+| `fits_stats_all_hdus(path, name_contains=None)` | list of `HduStats` | per image HDU: `index`, `name`, `naxis1`, `naxis2`, `bitpix`, `min`, `max`, `mean`, `min_int`, `max_int`, `elapsed_ms` |
 | `extract_cutouts(path, ra_deg, dec_deg, width, height, hdu=None, skip_errors=False)` | list of `Cutout` (or `None`) | one per position, same fields as `extract_cutout` |
 | `list_hdus(path)` | list of `HduInfo` | per HDU: `index`, `kind` (`PRIMARY`, `IMAGE`, `BINTABLE`...), `name`, `bitpix`, `shape` (NAXIS1, NAXIS2...), `readable`, `note` (why it is not readable) |
 | `detected_cpus()` | `int` | number of logical cores found on this machine |
@@ -305,7 +306,7 @@ Notes: `hdu=None` (the default) reads the primary HDU, exactly like before.
 `Cutout.data` is a plain Python list, so convert it with `np.array(...)` as
 above (fine for cutouts; it is not meant for multi-megapixel regions). The
 Parquet file has one row per pixel with columns `x`, `y` (absolute pixel
-coordinates in the source image) and `value`. All errors (file not found,
+coordinates in the source image) and `value` (an exact `Int64` / `UInt64` column for 64-bit integer images, `Float64` otherwise). All errors (file not found,
 wrong kind of HDU, cutout outside the image, unsupported WCS...) are raised
 as `ValueError`.
 
@@ -371,7 +372,7 @@ parallel, not from batching.
 
 `tests/test_input_validation.py` builds small FITS files with astropy and
 checks that supported files work (primary HDU, extensions, `BITPIX` 16 and
-64 including exact unsigned 64-bit values, `BZERO`/`BSCALE`), that unsupported ones are rejected with a clear error,
+64 including exact unsigned 64-bit values and gzip-compressed 64-bit images, `BZERO`/`BSCALE`), that unsupported ones are rejected with a clear error,
 that every supported projection, matrix form, the TPV distortion and the SIP
 distortion (including real SIP headers from astropy's own test data) agree with
 astropy/wcslib, and that tile-compressed images (`RICE_1`, `GZIP_1`,
@@ -521,7 +522,7 @@ file):
   terms.
 
 Measured on the development machine this project was built on: an Intel
-Core i7-8559U (4 cores / 8 threads), 31 GB RAM, no discrete GPU —
+Core i7-8559U (4 cores / 8 threads, 2.7 GHz base, up to 4.5 GHz), 31 GiB of RAM, an NVMe SSD, no discrete GPU —
 a laptop-class machine, not a cluster. This matters: the point of these
 numbers is "what you get on hardware a working astronomer might actually
 have on their desk," not a best-case HPC result. Each number is the
@@ -635,8 +636,8 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
   frame, one raw NISP detector and one segmentation map. That is enough to
   show the approach works on real archival products, not a representative
   sample across instruments, bands and tiles.
-- **Exact 64-bit integers, for raw images.** Signed and unsigned 64-bit images are exact in `min_int` / `max_int` and `data_int`. Everything else derived from them (`min`, `max`, `mean`, `data`, the Parquet `value` column) is `float64`, exact only up to 2^53 (about 9 × 10^15). The exact path needs `BSCALE = 1` and a whole-number `BZERO`; 64-bit integer images inside tile-compressed files are converted to `float64` throughout.
-- **Tested on one platform.** Linux (Debian 13, x86_64) only so far.
+- **64-bit integers are exact only in the integer fields.** For 64-bit integer images (signed, or unsigned via `BZERO = 2^63`; raw or gzip-compressed) the exact values are `min_int` / `max_int` and `data_int`, and the Parquet `value` column. The float fields (`min`, `max`, `mean`, `data`) are `float64`, exact only up to 2^53 (about 9 × 10^15), which is inherent to the type. The exact path needs whole-number `BSCALE` (|BSCALE| ≤ 2^20) and `BZERO` (|BZERO| ≤ 2^64); with a fractional `BSCALE` or `BZERO` the physical values are not integers anyway, so everything is `float64`.
+- **Tested on one machine only.** An Intel NUC running Debian 13 (Linux 6.12, x86_64): Intel Core i7-8559U (4 cores / 8 threads, 2.7 GHz, up to 4.5 GHz), 31 GiB of RAM, an NVMe SSD, Python 3.13.5 and Rust 1.100. macOS, Windows and ARM have not been tried, nor machines with a very different core count or much less memory (the images are memory-mapped, so a laptop with 8 GB of RAM should cope with the 1.47 GB tile, but I have not measured it).
 
 ## Roadmap
 
