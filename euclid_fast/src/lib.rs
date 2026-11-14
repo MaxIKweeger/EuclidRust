@@ -24,7 +24,7 @@ struct Wcs {
 }
 
 /// Minimal FITS header: only what is needed to read the pixel array.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct FitsHeader {
     bitpix: i32,
     naxis1: usize,
@@ -33,6 +33,8 @@ struct FitsHeader {
     bscale: f64,
     data_offset: usize, // byte offset where the pixels start
     wcs: Option<Wcs>,
+    ctype1: Option<String>, // projection of axis 1, e.g. "RA---TAN"
+    ctype2: Option<String>, // projection of axis 2, e.g. "DEC--TAN"
 }
 
 /// Parses the FITS header cards (2880-byte blocks = 36 cards of 80 bytes)
@@ -40,6 +42,9 @@ struct FitsHeader {
 /// no extensions), which is what the supported Euclid mosaics look like.
 fn parse_header(mmap: &[u8]) -> PyResult<FitsHeader> {
     let mut bitpix: Option<i32> = None;
+    let mut naxis: Option<usize> = None;
+    let mut ctype1: Option<String> = None;
+    let mut ctype2: Option<String> = None;
     let mut naxis1: Option<usize> = None;
     let mut naxis2: Option<usize> = None;
     let mut bzero: f64 = 0.0;
@@ -68,6 +73,18 @@ fn parse_header(mmap: &[u8]) -> PyResult<FitsHeader> {
 
             if keyword == "END" {
                 let data_offset = block_start + BLOCK_LEN;
+                let naxis = naxis.ok_or_else(|| PyValueError::new_err("missing NAXIS"))?;
+                if naxis == 0 {
+                    return Err(PyValueError::new_err(
+                        "the primary HDU holds no image (NAXIS = 0): the image is probably stored in an \
+                         extension or is tile-compressed (e.g. .fits.fz), which is not supported yet",
+                    ));
+                }
+                if naxis != 2 {
+                    return Err(PyValueError::new_err(format!(
+                        "NAXIS = {naxis} is not supported: only 2-D images are handled (3-D cubes are not)"
+                    )));
+                }
                 let bitpix = bitpix.ok_or_else(|| PyValueError::new_err("missing BITPIX"))?;
                 let naxis1 = naxis1.ok_or_else(|| PyValueError::new_err("missing NAXIS1"))?;
                 let naxis2 = naxis2.ok_or_else(|| PyValueError::new_err("missing NAXIS2"))?;
@@ -94,6 +111,8 @@ fn parse_header(mmap: &[u8]) -> PyResult<FitsHeader> {
                     bscale,
                     data_offset,
                     wcs,
+                    ctype1,
+                    ctype2,
                 });
             }
 
@@ -102,6 +121,9 @@ fn parse_header(mmap: &[u8]) -> PyResult<FitsHeader> {
                 let value_str = value_part.split('/').next().unwrap_or("").trim();
                 match keyword {
                     "BITPIX" => bitpix = value_str.parse::<i32>().ok(),
+                    "NAXIS" => naxis = value_str.parse::<usize>().ok(),
+                    "CTYPE1" => ctype1 = Some(value_str.trim_matches('\'').trim().to_string()),
+                    "CTYPE2" => ctype2 = Some(value_str.trim_matches('\'').trim().to_string()),
                     "NAXIS1" => naxis1 = value_str.parse::<usize>().ok(),
                     "NAXIS2" => naxis2 = value_str.parse::<usize>().ok(),
                     "BZERO" => bzero = value_str.parse::<f64>().unwrap_or(0.0),
@@ -345,6 +367,17 @@ fn extract_cutout_raw(
     let wcs = header
         .wcs
         .ok_or_else(|| PyValueError::new_err("this file has no WCS header (CRVAL/CRPIX/CD)"))?;
+
+    // Only the plain tangent projection is implemented. Anything else (SIN, ARC,
+    // TAN-SIP with distortion terms...) would silently give wrong positions.
+    if header.ctype1.as_deref() != Some("RA---TAN") || header.ctype2.as_deref() != Some("DEC--TAN") {
+        return Err(PyValueError::new_err(format!(
+            "unsupported WCS projection: expected CTYPE1/CTYPE2 = RA---TAN/DEC--TAN, found {}/{} \
+             (other projections and SIP distortion are not supported)",
+            header.ctype1.as_deref().unwrap_or("<missing>"),
+            header.ctype2.as_deref().unwrap_or("<missing>"),
+        )));
+    }
 
     let (px, py) = radec_to_pixel(ra_deg, dec_deg, &wcs);
     // Convert FITS 1-indexed -> 0-indexed array, then take the cutout's top-left corner.

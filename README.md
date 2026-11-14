@@ -25,6 +25,7 @@ euclid_fast.export_cutout_parquet("tile.fits", 83.82, -5.39, 50, 50, "cutout.par
 [How Python and Rust fit together](#how-python-and-rust-fit-together-pyo3) ·
 [Install](#install) ·
 [Use it](#use-it) ·
+[Tests](#run-the-tests-optional) ·
 [Run the benchmark](#run-the-benchmark-on-your-own-fits-file) ·
 [Troubleshooting](#troubleshooting) ·
 [Motivation](#motivation) ·
@@ -54,22 +55,21 @@ which is exactly what the benchmarks use.
 | Pixel type (`BITPIX`) | `8`, `16`, `32` (integers), `-32`, `-64` (floating point). `BZERO` / `BSCALE` are applied |
 | WCS, only needed for cutouts | `CTYPE1/2 = RA---TAN / DEC--TAN`, with `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix (`CD1_1`, `CD2_2`, and `CD1_2`, `CD2_1` if rotated). `fits_stats` needs no WCS |
 
-**Not supported.** This is what happens with other kinds of files (checked
-with test files):
+**Not supported.** Anything else is rejected with a `ValueError` that says
+why, rather than being read wrongly (these cases are covered by
+`tests/test_input_validation.py`):
 
-| Kind of file | What happens |
+| Kind of file | Error you get |
 |---|---|
-| Compressed images (Rice / GZIP tiles, `.fits.fz`) | Error: `ValueError: missing NAXIS1` |
-| Image stored in an extension rather than the primary HDU (multi-extension FITS; the primary HDU is then empty) | Same error: `missing NAXIS1` |
-| FITS tables / catalogues, spectra | Not images. They come back as the same `missing NAXIS1` error when the primary HDU is empty |
-| Not a FITS file | Error: `truncated file: no END card found` |
-| `BITPIX = 64` | Error: `BITPIX 64 is not supported yet` |
-| WCS written with `CDELT` (+`PC`) instead of a `CD` matrix, or no WCS | `fits_stats` works; cutouts raise `this file has no WCS header` |
-| **3-D cubes** (`NAXIS = 3`) | **No error: only the first 2-D plane is read**, so the statistics are not those of the whole cube |
-| **A projection other than TAN** (`SIN`, `ARC`...) or **SIP distortion** (`CTYPE` ending in `-SIP`) | **No error: the file is treated as plain TAN**, so cutout positions are wrong |
+| Compressed images (Rice / GZIP tiles, `.fits.fz`), or an image stored in an extension rather than the primary HDU (multi-extension FITS), including tables and catalogues | `the primary HDU holds no image (NAXIS = 0): the image is probably stored in an extension or is tile-compressed ...` |
+| 3-D cubes (`NAXIS = 3`) | `NAXIS = 3 is not supported: only 2-D images are handled` |
+| `BITPIX = 64` | `BITPIX 64 is not supported yet` |
+| Not a FITS file | `truncated file: no END card found` |
+| A projection other than TAN (`SIN`, `ARC`...), TAN with SIP distortion (`CTYPE` ending in `-SIP`), or a missing `CTYPE` | Cutouts raise `unsupported WCS projection: expected CTYPE1/CTYPE2 = RA---TAN/DEC--TAN, found ...` (`fits_stats` still works) |
+| WCS written with `CDELT` (+`PC`) instead of a `CD` matrix, or no WCS at all | Cutouts raise `this file has no WCS header` (`fits_stats` still works) |
 
-The last two rows matter: the code does **not** check for them yet, so
-please look at your file's header first. This takes five lines with astropy:
+To check a file before running anything on it, look at its header with
+astropy:
 
 ```python
 from astropy.io import fits
@@ -81,9 +81,8 @@ print("CD matrix present:", "CD1_1" in h and "CD2_2" in h)
 ```
 
 You want `NAXIS 2`, a `BITPIX` from the table above, `CTYPE RA---TAN
-DEC--TAN` (without a `-SIP` suffix) and `CD matrix present: True`. If
-`NAXIS` is `0`, your image is in an extension or compressed, and it will
-not work yet.
+DEC--TAN` and `CD matrix present: True`. If `NAXIS` is `0`, your image is in
+an extension or compressed, which is not supported yet.
 
 On Euclid data, the files that fit are the uncompressed **MER mosaics**
 (file names containing `MOSAIC`). Only the NISP Y-band `BGSUB-MOSAIC` tile
@@ -243,6 +242,19 @@ columns `x`, `y` (absolute pixel coordinates in the source image) and
 `value`. All errors (file not found, unsupported `BITPIX`, cutout outside
 the image, no WCS in the header...) are raised as `ValueError`.
 
+## Run the tests (optional)
+
+`tests/test_input_validation.py` builds small FITS files with astropy and
+checks that supported files work and unsupported ones are rejected with a
+clear error. With `euclid_fast` installed and `pip install -r
+scripts/requirements.txt` done:
+
+```bash
+python tests/test_input_validation.py     # prints "all input-validation checks passed"
+```
+
+(`pytest tests/` works too.)
+
 ## Run the benchmark on your own FITS file
 
 The script `scripts/benchmark_vs_astropy_real.py` times `euclid_fast`
@@ -309,7 +321,8 @@ loads the file into its cache.
 | Build error mentioning `edition2024` | Your Rust is older than 1.85. Run `rustup update`. |
 | `linker 'cc' not found` (Linux) / `link.exe not found` (Windows) | Install a C toolchain: `sudo apt install build-essential`, or the Visual Studio C++ Build Tools. |
 | `ModuleNotFoundError: No module named 'euclid_fast'` | You are in a different Python than the one you installed into. Activate the virtual environment (`source .venv/bin/activate`) and retry; check with `pip show euclid_fast`. |
-| `ValueError: missing NAXIS1`, `BITPIX ... is not supported` or `no END card found` | The file is not a plain uncompressed image in the primary HDU (compressed, multi-extension, table, not FITS...). See [What kind of files does it work with?](#what-kind-of-files-does-it-work-with). |
+| `ValueError: the primary HDU holds no image (NAXIS = 0)`, `NAXIS = 3 is not supported`, `BITPIX ... is not supported` or `no END card found` | The file is not a plain uncompressed 2-D image in the primary HDU (compressed, multi-extension, cube, table, not FITS...). See [What kind of files does it work with?](#what-kind-of-files-does-it-work-with). |
+| `ValueError: unsupported WCS projection ...` | The cutout functions only implement the plain `RA---TAN` / `DEC--TAN` projection. SIN, SIP and other WCS types are not supported yet. |
 | `ValueError: this file has no WCS header` | The cutout functions need `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix. `fits_stats` still works without them. |
 | `ValueError: cutout outside the image` | The RA/Dec you asked for falls outside the image. Check the coordinates against the header's `CRVAL1/2`. |
 | The benchmark exits asking for `numpy`/`astropy` | Run `pip install -r scripts/requirements.txt` in the same environment. |
@@ -438,10 +451,7 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
   added before cutout positions can be trusted at the sub-pixel level.
 - **Single HDU, single file.** No multi-extension FITS, no batch
   processing across a file list (yet — see Roadmap).
-- **Input is not validated enough.** 3-D cubes (only the first plane is
-  read) and non-TAN projections (treated as TAN) are accepted without an
-  error and give wrong results. Check your header first (see
-  [What kind of files does it work with?](#what-kind-of-files-does-it-work-with)).
+
 - **Real-data validation is currently one file, one band.** The results
   above come from a single Q1 NISP tile out of the ~35 TB Q1 release —
   enough to confirm the approach works unmodified on a real archival
