@@ -6,7 +6,7 @@ package; the full documentation lives in the
 [repository README](../README.md).
 
 ```bash
-pip install .        # run from this directory; needs a Rust toolchain (>= 1.85)
+pip install .        # run from this directory; needs a Rust toolchain (>= 1.88)
 ```
 
 ```python

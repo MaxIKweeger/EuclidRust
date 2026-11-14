@@ -156,6 +156,48 @@ def test_int64_exact_more(tmp):
         assert col.to_pylist() == (c.data_int if c.data_int is not None else c.data)
 
 
+def test_nan_pixels(tmp):
+    # NaN pixels are left out of min, max and mean (like numpy's nan* functions)
+    # and counted in n_nan; infinities are values and stay in.
+    rng = np.random.default_rng(0)
+    a = rng.normal(10, 1, (50, 60)).astype(np.float32)
+    a[5, 5] = np.nan
+    a[20:25, 10:15] = np.nan
+    p = write(tmp, "nan.fits", fits.HDUList([fits.PrimaryHDU(a)]))
+    s = euclid_fast.fits_stats(p)
+    assert (s.min, s.max) == (float(np.nanmin(a)), float(np.nanmax(a)))
+    assert abs(s.mean - float(np.nanmean(a, dtype=np.float64))) < 1e-9 and s.n_nan == 26
+    assert euclid_fast.fits_stats_many([p])[0].n_nan == 26
+    # the file with no NaN takes the same answer as plain numpy
+    clean = write(tmp, "clean.fits", fits.HDUList([fits.PrimaryHDU(np.nan_to_num(a, nan=10.0))]))
+    assert euclid_fast.fits_stats(clean).n_nan == 0
+    # all NaN: no valid pixel, so no statistics
+    s = euclid_fast.fits_stats(write(tmp, "allnan.fits", fits.HDUList([fits.PrimaryHDU(np.full((10, 10), np.nan, np.float32))])))
+    assert np.isnan(s.min) and np.isnan(s.max) and np.isnan(s.mean) and s.n_nan == 100
+    # integer images have no NaN
+    s = euclid_fast.fits_stats(write(tmp, "int.fits", fits.HDUList([fits.PrimaryHDU(np.arange(100, dtype=np.int16).reshape(10, 10))])))
+    assert s.n_nan == 0
+    # infinity is a value
+    inf = np.ones((10, 10), np.float32)
+    inf[0, 0] = np.inf
+    s = euclid_fast.fits_stats(write(tmp, "inf.fits", fits.HDUList([fits.PrimaryHDU(inf)])))
+    assert s.max == np.inf and s.n_nan == 0
+    # a frame: every HDU reports its own count
+    sci = fits.ImageHDU(a, name="DET11.SCI")
+    fr = write(tmp, "nanframe.fits", fits.HDUList([fits.PrimaryHDU(), sci]))
+    assert [r.n_nan for r in euclid_fast.fits_stats_all_hdus(fr)] == [26]
+
+
+def test_lookup_table_distortion_is_refused(tmp):
+    # Distortion stored in lookup tables (HST CPDIS / D2IMDIS keywords) cannot be
+    # applied: cutouts are refused rather than silently off; statistics still work.
+    for key in ("CPDIS1", "D2IMDIS2"):
+        h = fits.PrimaryHDU(IMG); add_wcs(h.header); h.header[key] = "Lookup"
+        p = write(tmp, f"lookup_{key}.fits", fits.HDUList([h]))
+        assert euclid_fast.fits_stats(p).naxis1 == 300
+        raises(lambda: cutout(p), "lookup tables")
+
+
 def test_extensions(tmp):
     # Layout of Euclid calibrated frames: empty primary, one image per extension.
     sci = fits.ImageHDU(IMG, name="DET11.SCI"); add_wcs(sci.header)
@@ -278,7 +320,9 @@ def _compressed_roundtrip(tmp, name, data, check_mean=True, **kw):
     s = euclid_fast.fits_stats(p, hdu=1)
     assert (s.min, s.max) == (float(np.nanmin(ref)), float(np.nanmax(ref))), (name, s.min, s.max)
     if check_mean:
-        assert abs(s.mean - float(ref.mean())) <= 1e-9 * max(1.0, abs(float(ref.mean()))), name
+        ref_mean = float(np.nanmean(ref))
+        assert abs(s.mean - ref_mean) <= 1e-9 * max(1.0, abs(ref_mean)), name
+    assert s.n_nan == int(np.isnan(ref).sum()), name
     ny, nx = ref.shape
     for fx, fy in ((0.3, 0.25), (0.62, 0.5), (0.5, 0.8), (0.85, 0.6)):       # tile borders, off-center
         ra, dec = wcs.all_pix2world(fx * nx, fy * ny, 1)
@@ -318,7 +362,7 @@ def test_compressed_images(tmp):
     _compressed_roundtrip(tmp, f"f{n}.fits", flt, compression_type="RICE_1", quantize_method=1,
                           dither_seed=123, tile_shape=(40, 50)); n += 1
     _compressed_roundtrip(tmp, f"f{n}.fits", flt.astype(np.float64), compression_type="RICE_1"); n += 1
-    _compressed_roundtrip(tmp, f"f{n}.fits", flt_nan, check_mean=False, compression_type="RICE_1",
+    _compressed_roundtrip(tmp, f"f{n}.fits", flt_nan, compression_type="RICE_1",
                           quantize_method=1, dither_seed=9); n += 1
     for algo in ("GZIP_1", "GZIP_2"):                 # lossless float (no quantization)
         _compressed_roundtrip(tmp, f"f{n}.fits", flt, compression_type=algo, quantize_level=0.0); n += 1
@@ -490,7 +534,7 @@ def test_batch(tmp):
 
 def test_all():
     for fn in (test_supported_primary, test_int64, test_extensions, test_unreadable_hdus,
-               test_int64_exact, test_int64_exact_more, test_rejected_inputs, test_tpv_matches_astropy, test_wcs_matches_astropy,
+               test_int64_exact, test_int64_exact_more, test_nan_pixels, test_lookup_table_distortion_is_refused, test_rejected_inputs, test_tpv_matches_astropy, test_wcs_matches_astropy,
                test_compressed_images, test_batch):
         with tempfile.TemporaryDirectory() as tmp:
             fn(tmp)

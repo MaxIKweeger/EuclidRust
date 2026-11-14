@@ -120,7 +120,10 @@ def main():
     def astropy_stats():
         with fits.open(path, memmap=memmap) as hdul:
             data = hdul[hdu_idx].data
-            return float(data.min()), float(data.max()), float(data.mean())
+            lo, hi, mean = float(data.min()), float(data.max()), float(data.mean())
+            if mean != mean:   # NaN pixels: numpy's plain functions give NaN, so use the NaN-aware ones
+                lo, hi, mean = float(np.nanmin(data)), float(np.nanmax(data)), float(np.nanmean(data, dtype=np.float64))
+            return lo, hi, mean
 
     def rust_stats():
         s = euclid_fast.fits_stats(path, hdu=hdu)
@@ -128,6 +131,7 @@ def main():
 
     astropy_stats_result = astropy_stats()
     rust_stats_result = rust_stats()
+    n_nan = euclid_fast.fits_stats(path, hdu=hdu).n_nan
     t_astropy_stats, _ = median_ms(astropy_stats, n_runs)
     t_rust_stats, _ = median_ms(rust_stats, n_runs)
 
@@ -157,7 +161,7 @@ def main():
             t_astropy_cutout, _ = median_ms(astropy_cutout, n_runs)
             t_rust_cutout, _ = median_ms(rust_cutout, n_runs)
             same_pixels = np.array_equal(
-                astropy_cutout_result.astype(np.float64).ravel(), np.asarray(rust_cutout_result)
+                astropy_cutout_result.astype(np.float64).ravel(), np.asarray(rust_cutout_result), equal_nan=True
             )
         except ValueError as e:        # euclid_fast refused the file/position: say why
             cutout_skipped = str(e)
@@ -167,6 +171,8 @@ def main():
     print(f"HDU: {'primary' if hdu is None else repr(hdu)}"
           + ("" if memmap else "   (BZERO/BSCALE present: astropy cannot memory-map, it reads the data into RAM)")
           + ("   (tile-compressed: astropy decompresses the whole image for the global stats)" if compressed else ""))
+    if n_nan:
+        print(f"{n_nan:,} NaN pixels: both sides leave them out (astropy side: numpy's nanmin / nanmax / nanmean)")
     print(f"Median over {n_runs} runs, after OS cache warm-up")
     print(f"CPU threads used by euclid_fast: {euclid_fast.detected_cpus()}")
     print("=" * 70)

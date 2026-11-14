@@ -74,7 +74,10 @@ why, rather than being read wrongly (these cases are covered by
 | 3-D cubes (`NAXIS = 3`) | `NAXIS = 3 is not supported ...: only 2-D images are handled` |
 | Not a FITS file | `truncated file: no END card found` |
 | A projection that is not implemented (cylindrical or all-sky ones such as `CAR`, `AIT`, `MOL`, `HPX`...), a mismatched `CTYPE` pair, or a missing `CTYPE` | Cutouts raise `unsupported WCS projection: found CTYPE1/CTYPE2 = ...; supported are RA---TAN/DEC--TAN (also with -SIP distortion), RA---TPV/DEC--TPV and the zenithal projections SIN, ARC, STG, ZEA and ZPN ...` (`fits_stats` still works) |
+| Distortion stored in lookup tables (HST `CPDIS` / `D2IMDIS` keywords) | Cutouts raise `this header declares distortion corrections stored in lookup tables ... which euclid_fast does not apply` (`fits_stats` still works) |
 | No WCS at all (no `CRVAL` / `CRPIX` / matrix keywords) | Cutouts raise `this file has no WCS header (CRVAL, CRPIX and either a CD matrix or CDELT/PC)` (`fits_stats` still works) |
+
+**Null pixels.** NaN pixels of floating-point images are left out of `min`, `max` and `mean` and counted in `n_nan` (infinities are values and stay in). The `BLANK` null value of integer images is **not** honoured: those pixels are counted as ordinary values.
 
 If you forget `hdu=` on a file whose primary HDU is empty, the error lists
 the image HDUs it found and tells you what to pass, for example
@@ -184,8 +187,7 @@ The scripts in `scripts/` contain no Rust and no PyO3 code; they only
 You need three things on your machine:
 
 - **Python 3.8 or newer** (developed and tested with 3.13).
-- **A Rust toolchain, version 1.85 or newer** (the crate uses Rust edition
-  2024; developed with 1.100). Install it with [rustup](https://rustup.rs/):
+- **A Rust toolchain, version 1.88 or newer** (the Arrow / Parquet dependencies require it; developed with 1.100). Install it with [rustup](https://rustup.rs/):
   - Linux / macOS: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
   - Windows: download `rustup-init.exe` from <https://rustup.rs/>. It will
     ask you to install the Visual Studio C++ Build Tools; accept.
@@ -293,11 +295,11 @@ Reference:
 
 | Function | Returns | Fields |
 |---|---|---|
-| `fits_stats(path, hdu=None)` | `FitsStats` | `min`, `max`, `mean`, `naxis1`, `naxis2`, `bitpix`, `threads_used`, `elapsed_ms`, and `min_int`, `max_int` (exact integers for 64-bit integer images, otherwise `None`) |
+| `fits_stats(path, hdu=None)` | `FitsStats` | `min`, `max`, `mean`, `naxis1`, `naxis2`, `bitpix`, `threads_used`, `elapsed_ms`, and `min_int`, `max_int` (exact integers for 64-bit integer images, otherwise `None`), `n_nan` (number of NaN pixels, which `min`, `max` and `mean` leave out) |
 | `extract_cutout(path, ra_deg, dec_deg, width, height, hdu=None)` | `Cutout` | `data` (flat list of floats, row-major), `data_int` (the same pixels as exact Python ints for 64-bit integer images, otherwise `None`), `width`, `height`, `pixel_x_center`, `pixel_y_center`, `elapsed_ms` |
 | `export_cutout_parquet(path, ra_deg, dec_deg, width, height, out_path, hdu=None)` | `ParquetExport` | `out_path`, `rows`, `elapsed_ms` |
 | `fits_stats_many(paths, hdu=None, skip_errors=False)` | list of `FitsStats` (or `None`) | one per file, in the same order; see [Many images at once](#many-images-at-once) |
-| `fits_stats_all_hdus(path, name_contains=None)` | list of `HduStats` | per image HDU: `index`, `name`, `naxis1`, `naxis2`, `bitpix`, `min`, `max`, `mean`, `min_int`, `max_int`, `elapsed_ms` |
+| `fits_stats_all_hdus(path, name_contains=None)` | list of `HduStats` | per image HDU: `index`, `name`, `naxis1`, `naxis2`, `bitpix`, `min`, `max`, `mean`, `min_int`, `max_int`, `n_nan`, `elapsed_ms` |
 | `extract_cutouts(path, ra_deg, dec_deg, width, height, hdu=None, skip_errors=False)` | list of `Cutout` (or `None`) | one per position, same fields as `extract_cutout` |
 | `list_hdus(path)` | list of `HduInfo` | per HDU: `index`, `kind` (`PRIMARY`, `IMAGE`, `BINTABLE`...), `name`, `bitpix`, `shape` (NAXIS1, NAXIS2...), `readable`, `note` (why it is not readable) |
 | `detected_cpus()` | `int` | number of logical cores found on this machine |
@@ -462,7 +464,7 @@ loads the file into its cache.
 | Symptom | Cause and fix |
 |---|---|
 | `rustc: command not found` or pip fails with "Cargo, the Rust package manager, is not installed" | Rust is not installed, or the terminal was opened before installing it. Install via [rustup](https://rustup.rs/) and open a **new** terminal. |
-| Build error mentioning `edition2024` | Your Rust is older than 1.85. Run `rustup update`. |
+| Build error mentioning `edition2024` or `rust-version` | Your Rust is older than 1.88. Run `rustup update`. |
 | `linker 'cc' not found` (Linux) / `link.exe not found` (Windows) | Install a C toolchain: `sudo apt install build-essential`, or the Visual Studio C++ Build Tools. |
 | `ModuleNotFoundError: No module named 'euclid_fast'` | You are in a different Python than the one you installed into. Activate the virtual environment (`source .venv/bin/activate`) and retry; check with `pip show euclid_fast`. |
 | `ValueError: the primary HDU holds no image (NAXIS = 0); it contains: ...` | The image is in an extension (Euclid calibrated/raw frames). Pass `hdu=` with the name or index shown in the message. |
@@ -470,6 +472,7 @@ loads the file into its cache.
 | `ValueError: ... tile-compressed image uses ZCMPTYPE = ...` or `... is a BINTABLE table, not an image` | That HDU uses a compression algorithm that is not implemented (only `RICE_1`, `GZIP_1`, `GZIP_2` are), or it is a table. |
 | `ValueError: NAXIS = 3 is not supported` or `no END card found` | A 3-D cube, or a file that is not FITS. Only 2-D images are handled. |
 | `ValueError: unsupported WCS projection ...` | The cutout functions implement the zenithal projections (`TAN`, `SIN`, `ARC`, `STG`, `ZEA`, `ZPN`), `TAN-SIP` and `TPV`. Cylindrical and all-sky projections, and WCS in other coordinate systems (galactic, ecliptic), are not supported yet. |
+| `ValueError: this header declares distortion corrections stored in lookup tables ...` | The header has HST-style `CPDIS` / `D2IMDIS` keywords. Their correction tables are not applied, so cutouts are refused. `fits_stats` still works. |
 | `ValueError: this file has no WCS header` | The cutout functions need `CRVAL1/2`, `CRPIX1/2` and a linear matrix (`CD`, or `CDELT` with an optional `PC`) in the chosen HDU. `fits_stats` still works without them. |
 | `ValueError: cutout outside the image` | The RA/Dec you asked for falls outside the image. Check the coordinates, and for frames make sure `hdu=` is the detector you mean (each detector covers a different patch of sky). |
 | The benchmark exits asking for `numpy`/`astropy` | Run `pip install -r scripts/requirements.txt` in the same environment. |
@@ -619,25 +622,108 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
 
 ## Known limitations (read before relying on this for science)
 
+### What it reads
+
+- **2-D images only.** No tables or catalogues, no 3-D cubes, no random-groups
+  files. Each call reads one HDU of one file (the batch functions loop over
+  files, HDUs or positions for you).
 - **Compression: `RICE_1`, `GZIP_1` and `GZIP_2` only.** `HCOMPRESS_1` and
   `PLIO_1` are not implemented and are refused with a clear error. The
   compressed files tested were produced by astropy/cfitsio, not by Euclid's
-  pipeline. Compressed cutouts decode whole tiles, so images compressed
-  with very large tiles make cutouts slower.
-- **Batch results are held in memory.** `fits_stats_many` and
-  `extract_cutouts` return everything as Python lists at the end: there is
-  no streaming and no progress callback, so a huge list of cutouts uses
-  memory proportional to its size. `hdu=` is the same for every file of a
-  `fits_stats_many` call.
-- **WCS coverage.** Zenithal projections (`TAN`, `SIN`, `ARC`, `STG`, `ZEA`, `ZPN`), with TPV or SIP distortion. Not supported: cylindrical and all-sky projections (`CAR`, `AIT`, `MOL`, `HPX`...), coordinate systems other than RA/Dec, and distortion given by lookup tables (as in some HST files). The sky-to-pixel inverse of TPV and SIP is iterative. It was checked against wcslib (through astropy) on over 120 synthetic headers and on real ones: the real Euclid VIS frame (TPV, 3 × 10^-8 pixel) and the real SIP headers shipped with astropy's tests, including HST/ACS (4 × 10^-9 pixel at worst). It can pick the wrong root when a SIP distortion is so strong (hundreds of pixels) that the inverse is not unique, which does not happen with real instruments.
+  pipeline.
+- **WCS coverage.** Zenithal projections (`TAN`, `SIN`, `ARC`, `STG`, `ZEA`,
+  `ZPN`), with TPV or SIP distortion. Not supported: cylindrical and all-sky
+  projections (`CAR`, `AIT`, `MOL`, `HPX`...), coordinate systems other than
+  RA/Dec, alternate WCS (`A`-`Z`: only the primary one is read), and
+  distortion given by lookup tables (HST `CPDIS` / `D2IMDIS`, which makes
+  cutouts fail with an error). The sky frame is not read: `RA` and `Dec` are
+  taken in the file's own frame, and `RADESYS` / `EQUINOX` are neither read
+  nor converted.
+- **Null pixels.** NaN pixels are left out of the statistics; the integer
+  `BLANK` null value is ignored (see above).
+
+### What a cutout is
+
+- **A cutout is a crop, not a resampling.** It is a rectangle of whole
+  pixels whose corner is `round(centre - size / 2)` (halves round away from
+  zero, whereas Python's `round` rounds halves to even, so a hand-made
+  comparison can differ by one pixel on an exact tie). The requested position
+  can therefore be up to half a pixel from the middle of the crop; the exact
+  fractional position is returned in `pixel_x_center` / `pixel_y_center`.
+  There is no interpolation, rotation or sub-pixel shift, and sizes are in
+  pixels, not in angle.
+- **Cutouts must lie fully inside the image.** One that touches the edge or
+  extends beyond it is refused (`cutout outside the image`); there is no
+  padding and no partial cutout.
+- **`Cutout.data` is a plain Python list of floats** (and `data_int` a list
+  of ints): fine for thumbnails, not meant for multi-megapixel regions.
+
+### Numbers
+
+- **Statistics.** `mean` is the mean of the valid (non-NaN) pixels. It
+  agrees with numpy to about 7 significant figures on float32 images, not to
+  the last digit, because the sums are made in a different order. Images with
+  NaN pixels take about three times longer than clean ones, because a second,
+  NaN-aware pass is needed (still faster than numpy's `nanmin` + `nanmax` +
+  `nanmean`; measured: 70 ms against 164 ms on 256 MB with 7% NaN).
+- **64-bit integers are exact only in the integer fields.** For 64-bit
+  integer images (signed, or unsigned via `BZERO = 2^63`; raw or
+  gzip-compressed) the exact values are `min_int` / `max_int` and
+  `data_int`, and the Parquet `value` column. The float fields (`min`, `max`,
+  `mean`, `data`) are `float64`, exact only up to 2^53 (about 9 × 10^15),
+  which is inherent to the type. The exact path needs whole-number `BSCALE`
+  (|BSCALE| ≤ 2^20) and `BZERO` (|BZERO| ≤ 2^64); with a fractional `BSCALE`
+  or `BZERO` the physical values are not integers anyway, so everything is
+  `float64`.
+- **The sky-to-pixel inverse of TPV and SIP is iterative.** It was checked
+  against wcslib (through astropy) on over 120 synthetic headers and on real
+  ones: the real Euclid VIS frame (TPV, 3 × 10^-8 pixel) and the real SIP
+  headers shipped with astropy's tests, including HST/ACS (4 × 10^-9 pixel
+  at worst). It can pick the wrong root when a SIP distortion is so strong
+  (hundreds of pixels) that the inverse is not unique, which does not happen
+  with real instruments.
+
+### How far it has been checked
+
 - **Real-data validation is small.** The benchmark numbers above come from
   a single Q1 NISP mosaic tile out of the ~35 TB Q1 release. Correctness
   (not speed) was also checked against astropy on one NISP frame, one VIS
   frame, one raw NISP detector and one segmentation map. That is enough to
   show the approach works on real archival products, not a representative
   sample across instruments, bands and tiles.
-- **64-bit integers are exact only in the integer fields.** For 64-bit integer images (signed, or unsigned via `BZERO = 2^63`; raw or gzip-compressed) the exact values are `min_int` / `max_int` and `data_int`, and the Parquet `value` column. The float fields (`min`, `max`, `mean`, `data`) are `float64`, exact only up to 2^53 (about 9 × 10^15), which is inherent to the type. The exact path needs whole-number `BSCALE` (|BSCALE| ≤ 2^20) and `BZERO` (|BZERO| ≤ 2^64); with a fractional `BSCALE` or `BZERO` the physical values are not integers anyway, so everything is `float64`.
-- **Tested on one machine only.** An Intel NUC running Debian 13 (Linux 6.12, x86_64): Intel Core i7-8559U (4 cores / 8 threads, 2.7 GHz, up to 4.5 GHz), 31 GiB of RAM, an NVMe SSD, Python 3.13.5 and Rust 1.100. macOS, Windows and ARM have not been tried, nor machines with a very different core count or much less memory (the images are memory-mapped, so a laptop with 8 GB of RAM should cope with the 1.47 GB tile, but I have not measured it).
+- **Tested on one machine only.** An Intel NUC running Debian 13 (Linux
+  6.12, x86_64): Intel Core i7-8559U (4 cores / 8 threads, 2.7 GHz, up to
+  4.5 GHz), 31 GiB of RAM, an NVMe SSD, Python 3.13.5 and Rust 1.100. macOS,
+  Windows and ARM have not been tried, nor other Python versions (the
+  package declares 3.8 or newer, which is what PyO3 supports, but only 3.13
+  was run), nor machines with a very different core count or much less
+  memory (the images are memory-mapped, so a laptop with 8 GB of RAM should
+  cope with the 1.47 GB tile, but I have not measured it).
+- **No continuous integration, no pre-built packages.** The tests are run by
+  hand. The workflow file in `euclid_fast/.github/` is not at the root of the
+  repository, so GitHub never runs it. The package is not on PyPI: you build
+  it yourself, which needs a Rust toolchain. The interface is version 0.1.0
+  and may change.
+
+### Practical points
+
+- **The files are memory-mapped and must not change while they are read.**
+  If another process truncates or overwrites a file during a call, the
+  operating system can kill the Python process (this is how `mmap` works; I
+  have not tried to provoke it). Network or FUSE file systems are untested.
+- **All the cores are used by default.** The number of threads follows the
+  machine; to limit it (a shared node, for example) set the environment
+  variable `RAYON_NUM_THREADS` before starting Python, e.g.
+  `RAYON_NUM_THREADS=4`. The GIL is released during the calls.
+- **Memory with compressed images.** Each worker thread decodes whole tiles
+  into `float64` (8 bytes per pixel), so an image compressed as a single huge
+  tile needs about eight times its pixel count in bytes. There is no tile
+  cache: many cutouts falling in the same tile decode it again each time.
+- **Batch results are held in memory.** `fits_stats_many` and
+  `extract_cutouts` return everything as Python lists at the end: there is
+  no streaming and no progress callback, so a huge list of cutouts uses
+  memory proportional to its size. `hdu=` is the same for every file of a
+  `fits_stats_many` call.
 
 ## Roadmap
 

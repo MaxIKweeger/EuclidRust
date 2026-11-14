@@ -104,6 +104,7 @@ struct RawHeader {
     pc: [Option<f64>; 4], // PC1_1, PC1_2, PC2_1, PC2_2
     crota2: Option<f64>,
     lonpole: Option<f64>,
+    lookup: bool, // the header declares lookup-table distortion (CPDIS / D2IMDIS)
     sip_a: Vec<(i32, i32, f64)>,
     sip_b: Vec<(i32, i32, f64)>,
     // --- tile-compressed images (a BINTABLE with ZIMAGE = T) ---
@@ -153,6 +154,7 @@ impl RawHeader {
             pc: [None; 4],
             crota2: None,
             lonpole: None,
+            lookup: false,
             sip_a: Vec::new(),
             sip_b: Vec::new(),
             zbitpix: None,
@@ -192,6 +194,7 @@ struct FitsHeader {
     wcs: Option<Wcs>,
     tiled: Option<Tiled>,   // Some(..) for tile-compressed images
     wcs_error: Option<String>, // why the WCS cannot be used, if it is present but unsupported
+    lookup_distortion: bool,   // the header declares distortion corrections stored in lookup tables
 }
 
 fn parse_f64(s: &str) -> Option<f64> {
@@ -267,6 +270,7 @@ fn read_header(mmap: &[u8], offset: usize) -> PyResult<(RawHeader, usize)> {
                     "PC2_2" => h.pc[3] = parse_f64(value_str),
                     "CROTA2" => h.crota2 = parse_f64(value_str),
                     "LONPOLE" => h.lonpole = parse_f64(value_str),
+                    "CPDIS1" | "CPDIS2" | "D2IMDIS1" | "D2IMDIS2" => h.lookup = true,
                     "CTYPE1" => h.ctype1 = Some(unquote(value_str)),
                     "CTYPE2" => h.ctype2 = Some(unquote(value_str)),
                     "ZBITPIX" => h.zbitpix = value_str.parse::<i32>().ok(),
@@ -1121,6 +1125,7 @@ fn locate_image(mmap: &[u8], sel: &Option<HduSelector>) -> PyResult<FitsHeader> 
             data_offset: 0,
             wcs: build_wcs(h).0,
             wcs_error: build_wcs(h).1,
+            lookup_distortion: h.lookup,
             tiled: Some(tiled),
         });
     }
@@ -1159,6 +1164,7 @@ fn locate_image(mmap: &[u8], sel: &Option<HduSelector>) -> PyResult<FitsHeader> 
         data_offset: hdu.data_offset,
         wcs: build_wcs(h).0,
         wcs_error: build_wcs(h).1,
+        lookup_distortion: h.lookup,
         tiled: None,
     })
 }
@@ -1285,26 +1291,32 @@ struct FitsStats {
     #[pyo3(get)]
     max_int: Option<i128>,
     #[pyo3(get)]
+    n_nan: usize, // number of NaN pixels, which min, max and mean leave out
+    #[pyo3(get)]
     threads_used: usize,
     #[pyo3(get)]
     elapsed_ms: f64,
 }
 
-/// (min, max, sum) of a slice of physical values.
-fn reduce_f64(v: &[f64]) -> (f64, f64, f64) {
+/// (min, max, sum of the valid values, number of NaN pixels) of a slice of
+/// physical values. NaN pixels are left out of min, max and sum.
+fn reduce_f64(v: &[f64]) -> (f64, f64, f64, usize) {
     let mut mn = f64::INFINITY;
     let mut mx = f64::NEG_INFINITY;
     let mut sum = 0.0_f64;
+    let mut nans = 0usize;
     for &x in v {
+        let ok = x == x;
         if x < mn {
             mn = x;
         }
         if x > mx {
             mx = x;
         }
-        sum += x;
+        sum += if ok { x } else { 0.0 };
+        nans += (!ok) as usize;
     }
-    (mn, mx, sum)
+    (mn, mx, sum, nans)
 }
 
 /// Computes min/max/mean of one image HDU. Pure Rust (no Python objects), so it
@@ -1317,6 +1329,11 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
     let n_pixels = header.naxis1 * header.naxis2;
 
     let mut exact: Option<(i128, i128)> = None;
+    let mut nan_count = 0usize;
+    let mut take = |r: (f64, f64, f64, usize)| -> (f64, f64, f64) {
+        nan_count += r.3;
+        (r.0, r.1, r.2)
+    };
     let (min, max, sum) = if let Some(t) = &header.tiled {
         let affine = if t.zbitpix == 64 { int64_affine(header.bzero, header.bscale) } else { None };
         if let Some(affine) = affine {
@@ -1330,11 +1347,11 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
             exact = Some((mn, mx));
             (mn as f64, mx as f64, sm as f64)
         } else {
-            let parts: Vec<(f64, f64, f64)> = (0..t.nrows)
+            let parts: Vec<(f64, f64, f64, usize)> = (0..t.nrows)
                 .into_par_iter()
                 .map(|i| decode_tile(t, &mmap, i).map(|v| reduce_f64(&v)))
                 .collect::<PyResult<Vec<_>>>()?;
-            parts.into_iter().fold((f64::INFINITY, f64::NEG_INFINITY, 0.0), |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 + b.2))
+            take(parts.into_iter().fold((f64::INFINITY, f64::NEG_INFINITY, 0.0, 0usize), |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 + b.2, a.3 + b.3)))
         }
     } else {
         let bytes_per_pixel = (header.bitpix.unsigned_abs() as usize) / 8;
@@ -1348,9 +1365,9 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
         // parallel over chunks of pixels. rayon sizes the number of threads
         // itself from the machine's logical core count.
         match header.bitpix {
-            16 => reduce_be::<i16>(data, header.bzero, header.bscale),
-            8 => reduce_be::<u8>(data, header.bzero, header.bscale),
-            32 => reduce_be::<i32>(data, header.bzero, header.bscale),
+            16 => take(reduce_be_checked::<i16>(data, header.bzero, header.bscale)),
+            8 => take(reduce_be_checked::<u8>(data, header.bzero, header.bscale)),
+            32 => take(reduce_be_checked::<i32>(data, header.bzero, header.bscale)),
             64 => match int64_affine(header.bzero, header.bscale) {
                 // Exact integer arithmetic: BZERO and BSCALE are applied as integers, so
                 // unsigned 64-bit data (BZERO = 2^63) and values above 2^53 stay exact.
@@ -1359,15 +1376,17 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
                     exact = Some((mn, mx));
                     (mn as f64, mx as f64, sm as f64)
                 }
-                None => reduce_be::<i64>(data, header.bzero, header.bscale),
+                None => take(reduce_be_checked::<i64>(data, header.bzero, header.bscale)),
             },
-            -32 => reduce_be::<f32>(data, header.bzero, header.bscale),
-            -64 => reduce_be::<f64>(data, header.bzero, header.bscale),
+            -32 => take(reduce_be_checked::<f32>(data, header.bzero, header.bscale)),
+            -64 => take(reduce_be_checked::<f64>(data, header.bzero, header.bscale)),
             other => return err(format!("BITPIX {other} is not supported yet")),
         }
     };
 
-    let mean = sum / n_pixels as f64;
+    // NaN pixels are left out of min, max and mean (and counted in n_nan).
+    let valid = n_pixels - nan_count;
+    let (min, max, mean) = if valid == 0 { (f64::NAN, f64::NAN, f64::NAN) } else { (min, max, sum / valid as f64) };
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(FitsStats {
@@ -1379,6 +1398,7 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
         mean,
         min_int: exact.map(|e| e.0),
         max_int: exact.map(|e| e.1),
+        n_nan: nan_count,
         threads_used: rayon::current_num_threads(),
         elapsed_ms,
     })
@@ -1422,6 +1442,8 @@ struct HduStats {
     min_int: Option<i128>,
     #[pyo3(get)]
     max_int: Option<i128>,
+    #[pyo3(get)]
+    n_nan: usize,
     #[pyo3(get)]
     elapsed_ms: f64,
 }
@@ -1504,6 +1526,7 @@ fn fits_stats_all_hdus(
                     mean: s.mean,
                     min_int: s.min_int,
                     max_int: s.max_int,
+                    n_nan: s.n_nan,
                     elapsed_ms: s.elapsed_ms,
                 })
             })
@@ -1555,14 +1578,9 @@ impl BigEndianSample for f64 {
     }
 }
 
-/// Parallel reduction (min, max, sum) over the raw pixels of type T,
-/// applying BZERO/BSCALE to get the physical value.
-///
-/// v2: instead of handing rayon a per-pixel iterator (per-element
-/// scheduling/fold overhead), the data is split into large blocks
-/// (`par_chunks`), each processed by a tight sequential loop -- the loop
-/// style LLVM auto-vectorizes best (implicit SIMD, no explicit intrinsics,
-/// no nightly) -- while keeping parallelism across blocks via rayon.
+/// Fast path of the parallel reduction: (min, max, sum) over the raw pixels of
+/// type T, with no per-pixel NaN bookkeeping (NaN pixels simply never win a
+/// min / max comparison, but they turn the sum into NaN).
 fn reduce_be<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) -> (f64, f64, f64) {
     const CHUNK_PIXELS: usize = 1 << 16; // 65536 pixels per rayon block
     let chunk_bytes = CHUNK_PIXELS * T::SIZE;
@@ -1589,6 +1607,58 @@ fn reduce_be<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) ->
         .reduce(
             || (f64::INFINITY, f64::NEG_INFINITY, 0.0_f64),
             |(mn1, mx1, s1), (mn2, mx2, s2)| (mn1.min(mn2), mx1.max(mx2), s1 + s2),
+        )
+}
+
+/// (min, max, sum of the valid pixels, number of NaN pixels). Takes the fast
+/// path, and only when its sum is NaN (the image has NaN pixels) pays for a
+/// second, NaN-aware pass.
+fn reduce_be_checked<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) -> (f64, f64, f64, usize) {
+    let (mn, mx, sum) = reduce_be::<T>(data, bzero, bscale);
+    if sum.is_nan() {
+        reduce_be_nan::<T>(data, bzero, bscale)
+    } else {
+        (mn, mx, sum, 0)
+    }
+}
+
+/// Parallel reduction (min, max, sum) over the raw pixels of type T,
+/// applying BZERO/BSCALE to get the physical value.
+///
+/// v2: instead of handing rayon a per-pixel iterator (per-element
+/// scheduling/fold overhead), the data is split into large blocks
+/// (`par_chunks`), each processed by a tight sequential loop -- the loop
+/// style LLVM auto-vectorizes best (implicit SIMD, no explicit intrinsics,
+/// no nightly) -- while keeping parallelism across blocks via rayon.
+fn reduce_be_nan<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) -> (f64, f64, f64, usize) {
+    const CHUNK_PIXELS: usize = 1 << 16; // 65536 pixels per rayon block
+    let chunk_bytes = CHUNK_PIXELS * T::SIZE;
+
+    data.par_chunks(chunk_bytes.max(T::SIZE))
+        .map(|chunk| {
+            let n = chunk.len() / T::SIZE;
+            let mut mn = f64::INFINITY;
+            let mut mx = f64::NEG_INFINITY;
+            let mut sum = 0.0_f64;
+            let mut nans = 0usize;
+            for i in 0..n {
+                let off = i * T::SIZE;
+                let v = bzero + bscale * T::from_be_slice(&chunk[off..off + T::SIZE]);
+                let ok = v == v; // false for NaN
+                if v < mn {
+                    mn = v;
+                }
+                if v > mx {
+                    mx = v;
+                }
+                sum += if ok { v } else { 0.0 };
+                nans += (!ok) as usize;
+            }
+            (mn, mx, sum, nans)
+        })
+        .reduce(
+            || (f64::INFINITY, f64::NEG_INFINITY, 0.0_f64, 0usize),
+            |(mn1, mx1, s1, n1), (mn2, mx2, s2, n2)| (mn1.min(mn2), mx1.max(mx2), s1 + s2, n1 + n2),
         )
 }
 
@@ -1930,6 +2000,9 @@ fn cutout_at(
 ) -> PyResult<(f64, f64, usize, usize, Vec<f64>, Option<Vec<i128>>)> {
     if let Some(msg) = &header.wcs_error {
         return err(msg.clone());
+    }
+    if header.lookup_distortion {
+        return err("this header declares distortion corrections stored in lookup tables (CPDIS / D2IMDIS keywords, as in HST files), which euclid_fast does not apply: cutout positions would be off");
     }
     let wcs = header.wcs.as_ref().ok_or_else(|| {
         PyValueError::new_err("this file has no WCS header (CRVAL, CRPIX and either a CD matrix or CDELT/PC)")
