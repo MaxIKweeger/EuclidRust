@@ -15,7 +15,8 @@ Usage (see the README for the full walkthrough):
 
     python scripts/benchmark_vs_astropy_real.py path/to/image.fits
 
-The FITS file must contain an uncompressed 2-D image with a standard
+The FITS file must contain a 2-D image (raw, or tile-compressed with RICE_1,
+GZIP_1 or GZIP_2; a compressed image is in extension 1, so pass --hdu 1) with a standard
 RA---TAN / DEC--TAN (or RA---TPV / DEC--TPV) WCS. For a Euclid MER mosaic
 tile the image is in the primary HDU. For calibrated frames (VIS, NISP) the
 images live in extensions: choose one with --hdu (an EXTNAME or a 0-based
@@ -98,6 +99,7 @@ def main():
         header = hdul[hdu_idx].header
         # astropy cannot memory-map images that need BZERO/BSCALE/BLANK scaling
         memmap = not any(k in header for k in ("BZERO", "BSCALE", "BLANK"))
+        compressed = isinstance(hdul[hdu_idx], fits.CompImageHDU)
         # Default cutout center: an integer pixel near the middle of the image,
         # converted to sky coordinates with the file's own WCS.
         try:
@@ -136,7 +138,10 @@ def main():
             x, y = wcs.all_world2pix(ra, dec, 0)  # 0-indexed
             x0 = int(round(float(x))) - size // 2
             y0 = int(round(float(y))) - size // 2
-            cutout = hdul[hdu_idx].data[y0 : y0 + size, x0 : x0 + size]
+            if compressed:   # astropy's way of reading a region without decompressing everything
+                cutout = hdul[hdu_idx].section[y0 : y0 + size, x0 : x0 + size]
+            else:
+                cutout = hdul[hdu_idx].data[y0 : y0 + size, x0 : x0 + size]
             return np.array(cutout)  # force the actual read
 
     def rust_cutout():
@@ -160,7 +165,8 @@ def main():
     print("=" * 70)
     print(f"File: {path}  ({os.path.getsize(path) / 1e9:.2f} GB)")
     print(f"HDU: {'primary' if hdu is None else repr(hdu)}"
-          + ("" if memmap else "   (BZERO/BSCALE present: astropy cannot memory-map, it reads the data into RAM)"))
+          + ("" if memmap else "   (BZERO/BSCALE present: astropy cannot memory-map, it reads the data into RAM)")
+          + ("   (tile-compressed: astropy decompresses the whole image for the global stats)" if compressed else ""))
     print(f"Median over {n_runs} runs, after OS cache warm-up")
     print(f"CPU threads used by euclid_fast: {euclid_fast.detected_cpus()}")
     print("=" * 70)

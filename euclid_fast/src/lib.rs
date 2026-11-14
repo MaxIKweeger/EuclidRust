@@ -1,8 +1,11 @@
+use flate2::read::GzDecoder;
 use memmap2::Mmap;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::fs::File;
+use std::io::Read;
+use std::sync::OnceLock;
 
 const CARD_LEN: usize = 80;
 const BLOCK_LEN: usize = 2880; // 36 cards of 80 bytes
@@ -73,6 +76,21 @@ struct RawHeader {
     ctype2: Option<String>,
     pv1: Vec<Option<f64>>,
     pv2: Vec<Option<f64>>,
+    // --- tile-compressed images (a BINTABLE with ZIMAGE = T) ---
+    zbitpix: Option<i32>,
+    znaxis: Option<usize>,
+    znaxes: Vec<usize>, // ZNAXIS1, ZNAXIS2, ...
+    ztiles: Vec<usize>, // ZTILE1, ZTILE2, ...
+    zcmptype: Option<String>,
+    znames: Vec<Option<String>>, // ZNAME1 .. ZNAME9
+    zvals: Vec<Option<f64>>,     // ZVAL1 .. ZVAL9
+    zquantiz: Option<String>,
+    zdither0: Option<i64>,
+    zblank: Option<i64>,
+    theap: Option<usize>,
+    tfields: usize,
+    ttype: Vec<String>, // TTYPE1 ..
+    tform: Vec<String>, // TFORM1 ..
 }
 
 impl RawHeader {
@@ -100,6 +118,20 @@ impl RawHeader {
             ctype2: None,
             pv1: vec![None; N_PV],
             pv2: vec![None; N_PV],
+            zbitpix: None,
+            znaxis: None,
+            znaxes: Vec::new(),
+            ztiles: Vec::new(),
+            zcmptype: None,
+            znames: vec![None; 9],
+            zvals: vec![None; 9],
+            zquantiz: None,
+            zdither0: None,
+            zblank: None,
+            theap: None,
+            tfields: 0,
+            ttype: Vec::new(),
+            tform: Vec::new(),
         }
     }
 }
@@ -119,10 +151,11 @@ struct FitsHeader {
     naxis2: usize,
     bzero: f64,
     bscale: f64,
-    data_offset: usize, // byte offset where the pixels start
+    data_offset: usize, // byte offset where the pixels start (raw images)
     wcs: Option<Wcs>,
     ctype1: Option<String>, // projection of axis 1, e.g. "RA---TAN"
     ctype2: Option<String>, // projection of axis 2, e.g. "DEC--TAN"
+    tiled: Option<Tiled>,   // Some(..) for tile-compressed images
 }
 
 fn parse_f64(s: &str) -> Option<f64> {
@@ -132,6 +165,13 @@ fn parse_f64(s: &str) -> Option<f64> {
 
 fn unquote(s: &str) -> String {
     s.trim_matches('\'').trim().to_string()
+}
+
+fn set_indexed<T: Clone>(v: &mut Vec<T>, i: usize, value: T, fill: T) {
+    if v.len() < i {
+        v.resize(i, fill);
+    }
+    v[i - 1] = value;
 }
 
 /// Parses the header cards of the HDU starting at `offset` (2880-byte blocks
@@ -165,6 +205,8 @@ fn read_header(mmap: &[u8], offset: usize) -> PyResult<(RawHeader, usize)> {
                     "NAXIS" => h.naxis = value_str.parse::<usize>().ok(),
                     "PCOUNT" => h.pcount = value_str.parse::<usize>().unwrap_or(0),
                     "GCOUNT" => h.gcount = value_str.parse::<usize>().unwrap_or(1),
+                    "THEAP" => h.theap = value_str.parse::<usize>().ok(),
+                    "TFIELDS" => h.tfields = value_str.parse::<usize>().unwrap_or(0),
                     "BZERO" => h.bzero = parse_f64(value_str).unwrap_or(0.0),
                     "BSCALE" => h.bscale = parse_f64(value_str).unwrap_or(1.0),
                     "CRVAL1" => h.crval1 = parse_f64(value_str),
@@ -177,15 +219,41 @@ fn read_header(mmap: &[u8], offset: usize) -> PyResult<(RawHeader, usize)> {
                     "CD2_2" => h.cd2_2 = parse_f64(value_str),
                     "CTYPE1" => h.ctype1 = Some(unquote(value_str)),
                     "CTYPE2" => h.ctype2 = Some(unquote(value_str)),
+                    "ZBITPIX" => h.zbitpix = value_str.parse::<i32>().ok(),
+                    "ZNAXIS" => h.znaxis = value_str.parse::<usize>().ok(),
+                    "ZCMPTYPE" => h.zcmptype = Some(unquote(value_str)),
+                    "ZQUANTIZ" => h.zquantiz = Some(unquote(value_str)),
+                    "ZDITHER0" => h.zdither0 = value_str.parse::<i64>().ok(),
+                    "ZBLANK" => h.zblank = value_str.parse::<i64>().ok(),
                     _ => {
+                        let idx = |rest: &str| rest.parse::<usize>().ok().filter(|i| (1..=999).contains(i));
                         if let Some(rest) = keyword.strip_prefix("NAXIS") {
-                            if let Ok(i) = rest.parse::<usize>() {
-                                if (1..=999).contains(&i) {
-                                    if h.naxes.len() < i {
-                                        h.naxes.resize(i, 0);
-                                    }
-                                    h.naxes[i - 1] = value_str.parse::<usize>().unwrap_or(0);
-                                }
+                            if let Some(i) = idx(rest) {
+                                set_indexed(&mut h.naxes, i, value_str.parse::<usize>().unwrap_or(0), 0);
+                            }
+                        } else if let Some(rest) = keyword.strip_prefix("ZNAXIS") {
+                            if let Some(i) = idx(rest) {
+                                set_indexed(&mut h.znaxes, i, value_str.parse::<usize>().unwrap_or(0), 0);
+                            }
+                        } else if let Some(rest) = keyword.strip_prefix("ZTILE") {
+                            if let Some(i) = idx(rest) {
+                                set_indexed(&mut h.ztiles, i, value_str.parse::<usize>().unwrap_or(0), 0);
+                            }
+                        } else if let Some(rest) = keyword.strip_prefix("ZNAME") {
+                            if let Some(i) = idx(rest).filter(|i| *i <= 9) {
+                                h.znames[i - 1] = Some(unquote(value_str));
+                            }
+                        } else if let Some(rest) = keyword.strip_prefix("ZVAL") {
+                            if let Some(i) = idx(rest).filter(|i| *i <= 9) {
+                                h.zvals[i - 1] = parse_f64(value_str);
+                            }
+                        } else if let Some(rest) = keyword.strip_prefix("TTYPE") {
+                            if let Some(i) = idx(rest) {
+                                set_indexed(&mut h.ttype, i, unquote(value_str), String::new());
+                            }
+                        } else if let Some(rest) = keyword.strip_prefix("TFORM") {
+                            if let Some(i) = idx(rest) {
+                                set_indexed(&mut h.tform, i, unquote(value_str), String::new());
                             }
                         } else if let Some(rest) = keyword.strip_prefix("PV1_") {
                             if let Ok(i) = rest.parse::<usize>() {
@@ -267,7 +335,23 @@ fn describe(hdu: &Hdu) -> String {
     let name = h.extname.clone().unwrap_or_default();
     let label = if name.is_empty() { String::new() } else { format!(" {name}") };
     if is_compressed_image(h) {
-        format!("[{}]{} (tile-compressed image, not supported yet)", hdu.index, label)
+        match build_tiled(h, hdu.data_offset) {
+            Ok(t) => format!(
+                "[{}]{} (tile-compressed {}, {}x{}, BITPIX {})",
+                hdu.index,
+                label,
+                t.algo.name(),
+                t.naxis1,
+                t.naxis2,
+                t.zbitpix
+            ),
+            Err(_) => format!(
+                "[{}]{} (tile-compressed with {}, not supported yet)",
+                hdu.index,
+                label,
+                h.zcmptype.clone().unwrap_or_else(|| "unknown algorithm".to_string())
+            ),
+        }
     } else {
         format!("[{}]{} ({}, BITPIX {})", hdu.index, label, shape_str(h), h.bitpix.unwrap_or(0))
     }
@@ -323,9 +407,529 @@ fn build_wcs(h: &RawHeader) -> Option<Wcs> {
     }
 }
 
-/// Finds the requested HDU, checks that it is a plain uncompressed 2-D image
-/// and returns what is needed to read its pixels. With `hdu=None` the
-/// primary HDU is used.
+// ---------------------------------------------------------------------------
+// Tile-compressed images (FITS "tiled image compression": the image is cut
+// into tiles, each compressed on its own and stored in a row of a BINTABLE).
+// Supported: RICE_1, GZIP_1, GZIP_2, with optional float quantization
+// (NO_DITHER, SUBTRACTIVE_DITHER_1, SUBTRACTIVE_DITHER_2).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Algo {
+    Rice,
+    Gzip1,
+    Gzip2,
+}
+
+impl Algo {
+    fn name(&self) -> &'static str {
+        match self {
+            Algo::Rice => "RICE_1",
+            Algo::Gzip1 => "GZIP_1",
+            Algo::Gzip2 => "GZIP_2",
+        }
+    }
+}
+
+/// A column of the compressed-image BINTABLE.
+#[derive(Debug, Clone, Copy)]
+struct Column {
+    offset: usize, // byte offset inside a table row
+    letter: char,  // TFORM type letter: 'P'/'Q' (variable length), 'D', 'E', 'J', ...
+    wide: bool,    // 'Q' descriptors (64-bit) instead of 'P' (32-bit)
+    elem: char,    // element type of a variable-length column ('B', 'I', 'J'...)
+}
+
+/// What is needed to decode the tiles of a compressed image.
+#[derive(Debug, Clone)]
+struct Tiled {
+    zbitpix: i32,
+    naxis1: usize,
+    naxis2: usize,
+    tile1: usize, // tile width in pixels
+    tile2: usize, // tile height in pixels
+    algo: Algo,
+    blocksize: usize, // Rice block size (ZVAL1, default 32)
+    bytepix: usize,   // Rice bytes per integer (ZVAL2, default 4)
+    dither: u8,       // 0 = no dither, 1 = SUBTRACTIVE_DITHER_1, 2 = SUBTRACTIVE_DITHER_2
+    dither_seed: i64, // ZDITHER0
+    zblank: Option<i64>,
+    bzero: f64,
+    bscale: f64,
+    table_offset: usize, // where the BINTABLE rows start
+    row_len: usize,
+    nrows: usize,
+    heap_offset: usize, // where the variable-length data (the heap) starts
+    comp: Option<Column>,
+    gzip: Option<Column>,
+    uncomp: Option<Column>,
+    zscale: Option<Column>,
+    zzero: Option<Column>,
+    zblank_col: Option<Column>,
+}
+
+fn parse_columns(h: &RawHeader) -> Result<Vec<(String, Column)>, String> {
+    let mut cols = Vec::new();
+    let mut offset = 0usize;
+    for i in 0..h.tfields {
+        let name = h.ttype.get(i).cloned().unwrap_or_default();
+        let form = h.tform.get(i).cloned().unwrap_or_default();
+        let digits: String = form.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let repeat: usize = if digits.is_empty() { 1 } else { digits.parse().unwrap_or(1) };
+        let mut rest = form[digits.len()..].chars();
+        let letter = rest.next().ok_or_else(|| format!("bad TFORM{} in the compressed-image table", i + 1))?;
+        let elem = rest.next().unwrap_or('B');
+        let size = match letter {
+            'L' | 'B' | 'A' => 1,
+            'X' => repeat.div_ceil(8),
+            'I' => 2 * repeat,
+            'J' | 'E' => 4 * repeat,
+            'K' | 'D' | 'C' => 8 * repeat,
+            'M' => 16 * repeat,
+            'P' => 8 * repeat,
+            'Q' => 16 * repeat,
+            other => return Err(format!("unsupported column type '{other}' in the compressed-image table")),
+        };
+        let size = if matches!(letter, 'L' | 'B' | 'A') { repeat } else { size };
+        cols.push((name, Column { offset, letter, wide: letter == 'Q', elem }));
+        offset += size;
+    }
+    Ok(cols)
+}
+
+fn build_tiled(h: &RawHeader, data_offset: usize) -> Result<Tiled, String> {
+    let ztype = h.zcmptype.clone().unwrap_or_default();
+    let algo = match ztype.as_str() {
+        "RICE_1" | "RICE_ONE" => Algo::Rice,
+        "GZIP_1" => Algo::Gzip1,
+        "GZIP_2" => Algo::Gzip2,
+        other => {
+            return Err(format!(
+                "tile-compressed image uses ZCMPTYPE = {} which is not supported yet (supported: RICE_1, GZIP_1, GZIP_2)",
+                if other.is_empty() { "<missing>" } else { other }
+            ))
+        }
+    };
+    let zbitpix = h.zbitpix.ok_or("missing ZBITPIX in the compressed image header")?;
+    if !matches!(zbitpix, 8 | 16 | 32 | 64 | -32 | -64) {
+        return Err(format!("ZBITPIX {zbitpix} is not supported"));
+    }
+    let znaxis = h.znaxis.ok_or("missing ZNAXIS in the compressed image header")?;
+    if znaxis != 2 {
+        return Err(format!(
+            "ZNAXIS = {znaxis} is not supported: only 2-D images are handled (3-D cubes are not)"
+        ));
+    }
+    let naxis1 = h.znaxes.first().copied().filter(|&v| v > 0).ok_or("missing ZNAXIS1")?;
+    let naxis2 = h.znaxes.get(1).copied().filter(|&v| v > 0).ok_or("missing ZNAXIS2")?;
+    let tile1 = h.ztiles.first().copied().filter(|&v| v > 0).unwrap_or(naxis1);
+    let tile2 = h.ztiles.get(1).copied().filter(|&v| v > 0).unwrap_or(1);
+
+    let mut blocksize = 32usize;
+    let mut bytepix = 4usize;
+    for (name, val) in h.znames.iter().zip(h.zvals.iter()) {
+        match (name.as_deref(), val) {
+            (Some(n), Some(v)) if n.eq_ignore_ascii_case("BLOCKSIZE") => blocksize = *v as usize,
+            (Some(n), Some(v)) if n.eq_ignore_ascii_case("BYTEPIX") => bytepix = *v as usize,
+            _ => {}
+        }
+    }
+    if algo == Algo::Rice && !matches!(bytepix, 1 | 2 | 4) {
+        return Err(format!("Rice BYTEPIX = {bytepix} is not supported (1, 2 or 4)"));
+    }
+    if blocksize == 0 {
+        return Err("Rice BLOCKSIZE = 0".to_string());
+    }
+    let dither = match h.zquantiz.as_deref() {
+        None | Some("NO_DITHER") | Some("NONE") => 0u8,
+        Some("SUBTRACTIVE_DITHER_1") => 1,
+        Some("SUBTRACTIVE_DITHER_2") => 2,
+        Some(other) => return Err(format!("ZQUANTIZ = {other} is not supported")),
+    };
+
+    // The BINTABLE geometry: NAXIS1 = bytes per row, NAXIS2 = number of rows = tiles.
+    let row_len = h.naxes.first().copied().ok_or("missing NAXIS1 in the compressed image table")?;
+    let nrows = h.naxes.get(1).copied().ok_or("missing NAXIS2 in the compressed image table")?;
+    let expected_tiles = naxis1.div_ceil(tile1) * naxis2.div_ceil(tile2);
+    if nrows != expected_tiles {
+        return Err(format!(
+            "the compressed-image table has {nrows} rows but the tiling implies {expected_tiles} tiles"
+        ));
+    }
+    let heap_offset = data_offset + h.theap.unwrap_or(row_len * nrows);
+
+    let cols = parse_columns(h)?;
+    let find = |name: &str| cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, c)| *c);
+    let comp = find("COMPRESSED_DATA");
+    let gzip = find("GZIP_COMPRESSED_DATA");
+    let uncomp = find("UNCOMPRESSED_DATA");
+    if comp.is_none() && gzip.is_none() && uncomp.is_none() {
+        return Err("the compressed-image table has no COMPRESSED_DATA column".to_string());
+    }
+    for c in [comp, gzip, uncomp].into_iter().flatten() {
+        if matches!(c.letter, 'P' | 'Q') && c.elem != 'B' {
+            return Err(format!("unsupported variable-length element type '{}' for tile data", c.elem));
+        }
+    }
+
+    Ok(Tiled {
+        zbitpix,
+        naxis1,
+        naxis2,
+        tile1,
+        tile2,
+        algo,
+        blocksize,
+        bytepix,
+        dither,
+        dither_seed: h.zdither0.unwrap_or(1),
+        zblank: h.zblank,
+        bzero: h.bzero,
+        bscale: h.bscale,
+        table_offset: data_offset,
+        row_len,
+        nrows,
+        heap_offset,
+        comp,
+        gzip,
+        uncomp,
+        zscale: find("ZSCALE"),
+        zzero: find("ZZERO"),
+        zblank_col: find("ZBLANK"),
+    })
+}
+
+fn be_u32(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+fn be_u64(b: &[u8]) -> u64 {
+    u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// The bytes a variable-length column points to for table row `row`.
+fn heap_bytes<'a>(t: &Tiled, mmap: &'a [u8], col: &Column, row: usize) -> PyResult<&'a [u8]> {
+    let base = t.table_offset + row * t.row_len + col.offset;
+    let width = if col.wide { 16 } else { 8 };
+    if base + width > mmap.len() {
+        return err("truncated file: the compressed-image table is cut short");
+    }
+    let (count, off) = if col.wide {
+        (be_u64(&mmap[base..]) as usize, be_u64(&mmap[base + 8..]) as usize)
+    } else {
+        (be_u32(&mmap[base..]) as usize, be_u32(&mmap[base + 4..]) as usize)
+    };
+    let start = t.heap_offset + off;
+    let end = start + count;
+    if end > mmap.len() {
+        return err("truncated file: a compressed tile points past the end of the file");
+    }
+    Ok(&mmap[start..end])
+}
+
+fn column_f64(t: &Tiled, mmap: &[u8], col: &Column, row: usize) -> PyResult<f64> {
+    let base = t.table_offset + row * t.row_len + col.offset;
+    match col.letter {
+        'D' if base + 8 <= mmap.len() => Ok(f64::from_bits(be_u64(&mmap[base..]))),
+        'E' if base + 4 <= mmap.len() => Ok(f32::from_bits(be_u32(&mmap[base..])) as f64),
+        _ => err("unsupported or truncated ZSCALE/ZZERO column in the compressed-image table"),
+    }
+}
+
+fn column_i64(t: &Tiled, mmap: &[u8], col: &Column, row: usize) -> Option<i64> {
+    let base = t.table_offset + row * t.row_len + col.offset;
+    match col.letter {
+        'J' if base + 4 <= mmap.len() => Some(be_u32(&mmap[base..]) as i32 as i64),
+        'K' if base + 8 <= mmap.len() => Some(be_u64(&mmap[base..]) as i64),
+        'I' if base + 2 <= mmap.len() => Some(i16::from_be_bytes([mmap[base], mmap[base + 1]]) as i64),
+        _ => None,
+    }
+}
+
+/// Rice decompression (the algorithm of cfitsio's `fits_rdecomp*`): decodes
+/// `n` integers of `bytepix` bytes each.
+fn rice_decode(bytes: &[u8], n: usize, blocksize: usize, bytepix: usize) -> PyResult<Vec<i64>> {
+    let (fsbits, fsmax, bbits): (i64, i64, i64) = match bytepix {
+        4 => (5, 25, 32),
+        2 => (4, 14, 16),
+        _ => (3, 6, 8),
+    };
+    let mask_bits: u64 = if bbits == 64 { u64::MAX } else { (1u64 << bbits) - 1 };
+    let corrupt = || PyValueError::new_err("corrupt Rice-compressed tile (ran out of data)");
+
+    let mut pos = 0usize;
+    if bytes.len() < bytepix + 1 {
+        return Err(corrupt());
+    }
+    // first value, stored raw, big-endian
+    let mut lastpix: u64 = 0;
+    for _ in 0..bytepix {
+        lastpix = (lastpix << 8) | bytes[pos] as u64;
+        pos += 1;
+    }
+    let next = |pos: &mut usize| -> PyResult<u64> {
+        let v = *bytes.get(*pos).ok_or_else(corrupt)? as u64;
+        *pos += 1;
+        Ok(v)
+    };
+
+    let mut b: u64 = next(&mut pos)?;
+    let mut nbits: i64 = 8;
+    let mut out: Vec<i64> = Vec::with_capacity(n);
+    let to_value = |v: u64| -> i64 {
+        match bytepix {
+            4 => v as u32 as i32 as i64,
+            2 => v as u16 as i16 as i64,
+            _ => v as u8 as i64,
+        }
+    };
+
+    let mut i = 0usize;
+    while i < n {
+        nbits -= fsbits;
+        while nbits < 0 {
+            b = (b << 8) | next(&mut pos)?;
+            nbits += 8;
+        }
+        let fs = (b >> nbits) as i64 - 1;
+        b &= (1u64 << nbits) - 1;
+        let imax = (i + blocksize).min(n);
+
+        if fs < 0 {
+            // low entropy: the whole block repeats the previous pixel
+            while i < imax {
+                out.push(to_value(lastpix));
+                i += 1;
+            }
+        } else if fs == fsmax {
+            // high entropy: the differences are stored raw, bbits bits each
+            while i < imax {
+                let mut k = bbits - nbits;
+                let mut diff: u64 = b << k;
+                k -= 8;
+                while k >= 0 {
+                    b = next(&mut pos)?;
+                    diff |= b << k;
+                    k -= 8;
+                }
+                if nbits > 0 {
+                    b = next(&mut pos)?;
+                    diff |= b >> (-k);
+                    b &= (1u64 << nbits) - 1;
+                } else {
+                    b = 0;
+                }
+                diff &= mask_bits;
+                // undo the zig-zag mapping
+                let d = if diff & 1 == 0 { diff >> 1 } else { !(diff >> 1) };
+                lastpix = d.wrapping_add(lastpix) & mask_bits;
+                out.push(to_value(lastpix));
+                i += 1;
+            }
+        } else {
+            // normal: unary-coded high part + fs low bits
+            while i < imax {
+                while b == 0 {
+                    nbits += 8;
+                    b = next(&mut pos)?;
+                }
+                let bit_len = 64 - b.leading_zeros() as i64;
+                let nzero = nbits - bit_len;
+                nbits -= nzero + 1;
+                b ^= 1u64 << nbits; // drop the leading one-bit
+                nbits -= fs;
+                while nbits < 0 {
+                    b = (b << 8) | next(&mut pos)?;
+                    nbits += 8;
+                }
+                let diff = ((nzero as u64) << fs) | (b >> nbits);
+                b &= (1u64 << nbits) - 1;
+                let d = if diff & 1 == 0 { diff >> 1 } else { !(diff >> 1) };
+                lastpix = d.wrapping_add(lastpix) & mask_bits;
+                out.push(to_value(lastpix));
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn gunzip(bytes: &[u8], expected: usize) -> PyResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(expected);
+    GzDecoder::new(bytes)
+        .read_to_end(&mut out)
+        .map_err(|e| PyValueError::new_err(format!("corrupt gzip-compressed tile: {e}")))?;
+    Ok(out)
+}
+
+/// Undoes the GZIP_2 byte shuffle: the compressor stores all the most
+/// significant bytes first, then the next ones, and so on.
+fn unshuffle(buf: &[u8], n: usize, size: usize) -> Vec<u8> {
+    let mut out = vec![0u8; buf.len()];
+    for i in 0..n {
+        for j in 0..size {
+            out[i * size + j] = buf[j * n + i];
+        }
+    }
+    out
+}
+
+/// One big-endian integer sample of `size` bytes (1 = unsigned byte).
+fn be_int(b: &[u8], size: usize) -> i64 {
+    match size {
+        1 => b[0] as i64,
+        2 => i16::from_be_bytes([b[0], b[1]]) as i64,
+        4 => i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as i64,
+        _ => i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+    }
+}
+
+const N_RANDOM: usize = 10000;
+const ZERO_VALUE: i64 = -2147483646;
+
+/// The 10000 pseudo-random numbers used by subtractive dithering (a
+/// Park-Miller generator, exactly as in cfitsio so the dither can be undone).
+fn random_table() -> &'static Vec<f32> {
+    static TABLE: OnceLock<Vec<f32>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let a = 16807.0f64;
+        let m = 2147483647.0f64;
+        let mut seed = 1.0f64;
+        (0..N_RANDOM)
+            .map(|_| {
+                let temp = a * seed;
+                seed = temp - m * ((temp / m) as i64 as f64);
+                (seed / m) as f32
+            })
+            .collect()
+    })
+}
+
+/// Samples stored as plain big-endian values (uncompressed or losslessly
+/// gzipped tiles), converted to physical f64 values.
+fn samples_to_f64(t: &Tiled, buf: &[u8], n: usize) -> PyResult<Vec<f64>> {
+    let size = (t.zbitpix.unsigned_abs() as usize) / 8;
+    if buf.len() < n * size {
+        return err("corrupt tile: fewer bytes than the tile size implies");
+    }
+    Ok((0..n)
+        .map(|i| {
+            let b = &buf[i * size..(i + 1) * size];
+            match t.zbitpix {
+                -32 => f32::from_bits(be_u32(b)) as f64,
+                -64 => f64::from_bits(be_u64(b)),
+                _ => t.bzero + t.bscale * be_int(b, size) as f64,
+            }
+        })
+        .collect())
+}
+
+/// Decodes one tile (identified by its row number in the table) into
+/// physical f64 values, row-major, `w * h` of them.
+fn decode_tile(t: &Tiled, mmap: &[u8], tile_index: usize) -> PyResult<Vec<f64>> {
+    let ntx = t.naxis1.div_ceil(t.tile1);
+    let (tx, ty) = (tile_index % ntx, tile_index / ntx);
+    let w = t.tile1.min(t.naxis1 - tx * t.tile1);
+    let h = t.tile2.min(t.naxis2 - ty * t.tile2);
+    let n = w * h;
+
+    let nonempty = |c: &Option<Column>| -> PyResult<Option<&[u8]>> {
+        match c {
+            Some(col) => Ok(Some(heap_bytes(t, mmap, col, tile_index)?).filter(|b| !b.is_empty())),
+            None => Ok(None),
+        }
+    };
+
+    if let Some(bytes) = nonempty(&t.comp)? {
+        // A floating-point image is stored as quantized integers when the table
+        // has ZSCALE / ZZERO columns; without them (lossless mode) cfitsio puts
+        // the gzipped raw floating-point samples in this same column.
+        let is_quantized = t.zbitpix < 0 && t.zscale.is_some();
+        if t.zbitpix < 0 && !is_quantized {
+            if t.algo == Algo::Rice {
+                return err("Rice-compressed floating-point tile without a ZSCALE column");
+            }
+            let size = (t.zbitpix.unsigned_abs() as usize) / 8;
+            let mut buf = gunzip(bytes, n * size)?;
+            if t.algo == Algo::Gzip2 {
+                buf = unshuffle(&buf, n, size);
+            }
+            return samples_to_f64(t, &buf, n);
+        }
+        let int_size = if is_quantized { 4 } else { (t.zbitpix.unsigned_abs() as usize) / 8 };
+        let ints: Vec<i64> = match t.algo {
+            Algo::Rice => rice_decode(bytes, n, t.blocksize, t.bytepix)?,
+            Algo::Gzip1 | Algo::Gzip2 => {
+                let mut buf = gunzip(bytes, n * int_size)?;
+                if buf.len() != n * int_size {
+                    return err("corrupt gzip-compressed tile: unexpected size");
+                }
+                if t.algo == Algo::Gzip2 {
+                    buf = unshuffle(&buf, n, int_size);
+                }
+                (0..n).map(|i| be_int(&buf[i * int_size..(i + 1) * int_size], int_size)).collect()
+            }
+        };
+        if !is_quantized {
+            return Ok(ints.into_iter().map(|v| t.bzero + t.bscale * v as f64).collect());
+        }
+        // floating-point image stored as quantized integers: undo the
+        // quantization (and the dither, if any) with this tile's scale/zero.
+        let scale = match &t.zscale {
+            Some(c) => column_f64(t, mmap, c, tile_index)?,
+            None => return err("the compressed-image table has no ZSCALE column"),
+        };
+        let zero = match &t.zzero {
+            Some(c) => column_f64(t, mmap, c, tile_index)?,
+            None => return err("the compressed-image table has no ZZERO column"),
+        };
+        let tnull = t.zblank_col.and_then(|c| column_i64(t, mmap, &c, tile_index)).or(t.zblank);
+        let rand = random_table();
+        let mut iseed = ((tile_index as i64 + t.dither_seed - 1).rem_euclid(N_RANDOM as i64)) as usize;
+        let mut nextrand = (rand[iseed] * 500.0) as usize;
+        let mut out = Vec::with_capacity(n);
+        for &iv in &ints {
+            let v = if Some(iv) == tnull {
+                f64::NAN
+            } else if t.dither == 2 && iv == ZERO_VALUE {
+                0.0
+            } else if t.dither == 0 {
+                iv as f64 * scale + zero
+            } else {
+                (iv as f64 - rand[nextrand] as f64 + 0.5) * scale + zero
+            };
+            out.push(if t.zbitpix == -32 { v as f32 as f64 } else { v });
+            if t.dither != 0 {
+                nextrand += 1;
+                if nextrand == N_RANDOM {
+                    iseed += 1;
+                    if iseed == N_RANDOM {
+                        iseed = 0;
+                    }
+                    nextrand = (rand[iseed] * 500.0) as usize;
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    let size = (t.zbitpix.unsigned_abs() as usize) / 8;
+    if let Some(bytes) = nonempty(&t.gzip)? {
+        // lossless gzip of the raw samples (used for floats that were not quantized)
+        let mut buf = gunzip(bytes, n * size)?;
+        if t.algo == Algo::Gzip2 {
+            buf = unshuffle(&buf, n, size);
+        }
+        return samples_to_f64(t, &buf, n);
+    }
+    if let Some(bytes) = nonempty(&t.uncomp)? {
+        return samples_to_f64(t, bytes, n);
+    }
+    err(format!("tile {tile_index} has no data in any of the table's data columns"))
+}
+
+/// Finds the requested HDU, checks that it is a plain 2-D image (raw or
+/// tile-compressed) and returns what is needed to read its pixels. With
+/// `hdu=None` the primary HDU is used.
 fn locate_image(mmap: &[u8], sel: &Option<HduSelector>) -> PyResult<FitsHeader> {
     let implicit_primary = matches!(sel, None | Some(HduSelector::Index(0)));
 
@@ -360,7 +964,19 @@ fn locate_image(mmap: &[u8], sel: &Option<HduSelector>) -> PyResult<FitsHeader> 
     let h = &hdu.header;
 
     if is_compressed_image(h) {
-        return err(format!("{label} is a tile-compressed image (ZIMAGE), which is not supported yet"));
+        let tiled = build_tiled(h, hdu.data_offset).map_err(|e| PyValueError::new_err(format!("{label}: {e}")))?;
+        return Ok(FitsHeader {
+            bitpix: tiled.zbitpix,
+            naxis1: tiled.naxis1,
+            naxis2: tiled.naxis2,
+            bzero: h.bzero,
+            bscale: h.bscale,
+            data_offset: 0,
+            wcs: build_wcs(h),
+            ctype1: h.ctype1.clone(),
+            ctype2: h.ctype2.clone(),
+            tiled: Some(tiled),
+        });
     }
     if !is_image_hdu(h) {
         return err(format!("{label} is a {} table, not an image", hdu_kind(h)));
@@ -398,6 +1014,7 @@ fn locate_image(mmap: &[u8], sel: &Option<HduSelector>) -> PyResult<FitsHeader> 
         wcs: build_wcs(h),
         ctype1: h.ctype1.clone(),
         ctype2: h.ctype2.clone(),
+        tiled: None,
     })
 }
 
@@ -420,9 +1037,9 @@ struct HduInfo {
     #[pyo3(get)]
     shape: Vec<usize>, // (NAXIS1, NAXIS2, ...) in FITS order
     #[pyo3(get)]
-    readable: bool, // True if euclid_fast can read it (uncompressed 2-D image, supported BITPIX)
+    readable: bool, // True if euclid_fast can read it (2-D image, supported BITPIX / compression)
     #[pyo3(get)]
-    note: String, // why it is not readable, or ""
+    note: String, // e.g. "tile-compressed RICE_1", or why it is not readable
 }
 
 #[pymethods]
@@ -454,11 +1071,31 @@ fn list_hdus(path: &str) -> PyResult<Vec<HduInfo>> {
         .iter()
         .map(|x| {
             let h = &x.header;
+            if is_compressed_image(h) {
+                return match build_tiled(h, x.data_offset) {
+                    Ok(t) => HduInfo {
+                        index: x.index,
+                        kind: hdu_kind(h),
+                        name: h.extname.clone().unwrap_or_default(),
+                        bitpix: Some(t.zbitpix),
+                        shape: vec![t.naxis1, t.naxis2],
+                        readable: true,
+                        note: format!("tile-compressed {}", t.algo.name()),
+                    },
+                    Err(e) => HduInfo {
+                        index: x.index,
+                        kind: hdu_kind(h),
+                        name: h.extname.clone().unwrap_or_default(),
+                        bitpix: h.zbitpix,
+                        shape: h.znaxes.clone(),
+                        readable: false,
+                        note: e,
+                    },
+                };
+            }
             let naxis = h.naxis.unwrap_or(0);
             let supported_bitpix = matches!(h.bitpix, Some(8) | Some(16) | Some(32) | Some(64) | Some(-32) | Some(-64));
-            let (readable, note) = if is_compressed_image(h) {
-                (false, "tile-compressed image, not supported yet".to_string())
-            } else if !is_image_hdu(h) {
+            let (readable, note) = if !is_image_hdu(h) {
                 (false, "table, not an image".to_string())
             } else if naxis == 0 {
                 (false, "no image data".to_string())
@@ -504,11 +1141,30 @@ struct FitsStats {
     elapsed_ms: f64,
 }
 
-/// Reads a FITS image (uncompressed, 2-D) through mmap (zero-copy for the
-/// disk -> memory part) and computes min/max/mean in parallel with rayon.
-/// The rayon thread pool sizes itself to the number of cores available on
-/// the machine (no hardcoded value). `hdu` selects the HDU by 0-based index
-/// or EXTNAME; by default the primary HDU is read.
+/// (min, max, sum) of a slice of physical values.
+fn reduce_f64(v: &[f64]) -> (f64, f64, f64) {
+    let mut mn = f64::INFINITY;
+    let mut mx = f64::NEG_INFINITY;
+    let mut sum = 0.0_f64;
+    for &x in v {
+        if x < mn {
+            mn = x;
+        }
+        if x > mx {
+            mx = x;
+        }
+        sum += x;
+    }
+    (mn, mx, sum)
+}
+
+/// Reads a FITS image (2-D, raw or tile-compressed) and computes min/max/mean
+/// in parallel with rayon. Raw images are read through mmap (zero-copy for the
+/// disk -> memory part); compressed images are decoded tile by tile, the tiles
+/// being spread over the threads. The rayon thread pool sizes itself to the
+/// number of cores available on the machine (no hardcoded value). `hdu`
+/// selects the HDU by 0-based index or EXTNAME; by default the primary HDU is
+/// read.
 #[pyfunction]
 #[pyo3(signature = (path, hdu=None))]
 fn fits_stats(path: &str, hdu: Option<HduSelector>) -> PyResult<FitsStats> {
@@ -517,25 +1173,33 @@ fn fits_stats(path: &str, hdu: Option<HduSelector>) -> PyResult<FitsStats> {
     let mmap = open_mmap(path)?;
     let header = locate_image(&mmap, &hdu)?;
     let n_pixels = header.naxis1 * header.naxis2;
-    let bytes_per_pixel = (header.bitpix.unsigned_abs() as usize) / 8;
-    let data_end = header.data_offset + n_pixels * bytes_per_pixel;
 
-    if data_end > mmap.len() {
-        return err("truncated file: fewer pixels than the header announces");
-    }
-    let data = &mmap[header.data_offset..data_end];
+    let (min, max, sum) = if let Some(t) = &header.tiled {
+        let parts: Vec<(f64, f64, f64)> = (0..t.nrows)
+            .into_par_iter()
+            .map(|i| decode_tile(t, &mmap, i).map(|v| reduce_f64(&v)))
+            .collect::<PyResult<Vec<_>>>()?;
+        parts.into_iter().fold((f64::INFINITY, f64::NEG_INFINITY, 0.0), |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 + b.2))
+    } else {
+        let bytes_per_pixel = (header.bitpix.unsigned_abs() as usize) / 8;
+        let data_end = header.data_offset + n_pixels * bytes_per_pixel;
+        if data_end > mmap.len() {
+            return err("truncated file: fewer pixels than the header announces");
+        }
+        let data = &mmap[header.data_offset..data_end];
 
-    // Read + convert to "physical" f64 (BZERO + BSCALE * raw_value), in
-    // parallel over chunks of pixels. rayon sizes the number of threads
-    // itself from the machine's logical core count.
-    let (min, max, sum) = match header.bitpix {
-        16 => reduce_be::<i16>(data, header.bzero, header.bscale),
-        8 => reduce_be::<u8>(data, header.bzero, header.bscale),
-        32 => reduce_be::<i32>(data, header.bzero, header.bscale),
-        64 => reduce_be::<i64>(data, header.bzero, header.bscale),
-        -32 => reduce_be::<f32>(data, header.bzero, header.bscale),
-        -64 => reduce_be::<f64>(data, header.bzero, header.bscale),
-        other => return err(format!("BITPIX {other} is not supported yet")),
+        // Read + convert to "physical" f64 (BZERO + BSCALE * raw_value), in
+        // parallel over chunks of pixels. rayon sizes the number of threads
+        // itself from the machine's logical core count.
+        match header.bitpix {
+            16 => reduce_be::<i16>(data, header.bzero, header.bscale),
+            8 => reduce_be::<u8>(data, header.bzero, header.bscale),
+            32 => reduce_be::<i32>(data, header.bzero, header.bscale),
+            64 => reduce_be::<i64>(data, header.bzero, header.bscale),
+            -32 => reduce_be::<f32>(data, header.bzero, header.bscale),
+            -64 => reduce_be::<f64>(data, header.bzero, header.bscale),
+            other => return err(format!("BITPIX {other} is not supported yet")),
+        }
     };
 
     let mean = sum / n_pixels as f64;
@@ -826,6 +1490,39 @@ fn extract_cutout_raw(
     }
     let (x0, y0) = (x0 as usize, y0 as usize);
 
+    if let Some(t) = &header.tiled {
+        // Compressed image: decode only the tiles that overlap the cutout.
+        let ntx = t.naxis1.div_ceil(t.tile1);
+        let (tx_lo, tx_hi) = (x0 / t.tile1, (x0 + width - 1) / t.tile1);
+        let (ty_lo, ty_hi) = (y0 / t.tile2, (y0 + height - 1) / t.tile2);
+        let wanted: Vec<(usize, usize)> =
+            (ty_lo..=ty_hi).flat_map(|ty| (tx_lo..=tx_hi).map(move |tx| (tx, ty))).collect();
+        let decoded: Vec<Vec<f64>> = wanted
+            .par_iter()
+            .map(|&(tx, ty)| decode_tile(t, &mmap, ty * ntx + tx))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let mut data = vec![0.0f64; width * height];
+        for (&(tx, ty), tile) in wanted.iter().zip(decoded.iter()) {
+            let (tile_x0, tile_y0) = (tx * t.tile1, ty * t.tile2);
+            let tile_w = t.tile1.min(t.naxis1 - tile_x0);
+            for row in 0..height {
+                let y = y0 + row;
+                if y < tile_y0 || y >= tile_y0 + t.tile2.min(t.naxis2 - tile_y0) {
+                    continue;
+                }
+                for col in 0..width {
+                    let x = x0 + col;
+                    if x < tile_x0 || x >= tile_x0 + tile_w {
+                        continue;
+                    }
+                    data[row * width + col] = tile[(y - tile_y0) * tile_w + (x - tile_x0)];
+                }
+            }
+        }
+        return Ok((px, py, x0, y0, data));
+    }
+
     let bytes_per_pixel = (header.bitpix.unsigned_abs() as usize) / 8;
     let row_stride = header.naxis1 * bytes_per_pixel;
     let last_byte = header.data_offset + (y0 + height) * row_stride;
@@ -860,8 +1557,10 @@ fn extract_cutout_raw(
 /// degrees) without reading the whole file: through mmap only the few
 /// rows needed are touched -- the OS only loads into RAM the memory pages
 /// that correspond to the bytes actually read (that is the project's whole
-/// point: no need to read 1 GB to extract a thumbnail). `hdu` selects the
-/// HDU by 0-based index or EXTNAME; by default the primary HDU is read.
+/// point: no need to read 1 GB to extract a thumbnail). For tile-compressed
+/// images only the tiles overlapping the cutout are decompressed. `hdu`
+/// selects the HDU by 0-based index or EXTNAME; by default the primary HDU
+/// is read.
 #[pyfunction]
 #[pyo3(signature = (path, ra_deg, dec_deg, width, height, hdu=None))]
 fn extract_cutout(

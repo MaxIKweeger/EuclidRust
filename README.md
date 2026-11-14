@@ -35,8 +35,8 @@ euclid_fast.export_cutout_parquet("tile.fits", 83.82, -5.39, 50, 50, "cutout.par
 
 ## What kind of files does it work with?
 
-**Short answer: uncompressed 2-D FITS images, whether the image sits in the
-primary HDU or in an extension.**
+**Short answer: 2-D FITS images, raw or tile-compressed (Rice / GZIP), whether the
+image sits in the primary HDU or in an extension.**
 
 FITS (Flexible Image Transport System) is the standard file format of
 astronomy. A FITS file is a sequence of blocks called HDUs ("header/data
@@ -57,7 +57,8 @@ contains.
 
 | Requirement | Details |
 |---|---|
-| An image HDU | 2-D (`NAXIS = 2`) and uncompressed. The primary HDU by default, or any image extension through `hdu=` (0-based index or `EXTNAME`) |
+| An image HDU | 2-D (`NAXIS = 2`). The primary HDU by default, or any image extension through `hdu=` (0-based index or `EXTNAME`) |
+| Compression | None, or FITS tile compression with `RICE_1`, `GZIP_1` or `GZIP_2` (the `.fits.fz` format written by `fpack` and by astropy's `CompImageHDU`), including quantized floating-point images (`NO_DITHER`, `SUBTRACTIVE_DITHER_1`, `SUBTRACTIVE_DITHER_2`). A compressed image always lives in an extension, so pass `hdu=1` (or its name) |
 | Pixel type (`BITPIX`) | `8`, `16`, `32`, `64` (integers), `-32`, `-64` (floating point). `BZERO` / `BSCALE` are applied, so unsigned 16-bit raw data (`BZERO = 32768`) works. 64-bit integers are converted to `float64`, which is exact up to 2^53 (about 9 × 10^15) |
 | WCS, only needed for cutouts | `CTYPE1/2 = RA---TAN / DEC--TAN`, **or** `RA---TPV / DEC--TPV` (the tangent projection plus the polynomial distortion `PV1_m` / `PV2_m` used by the Euclid VIS pipeline), together with `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix (`CD1_1`, `CD2_2`, and `CD1_2`, `CD2_1` if rotated). `fits_stats` needs no WCS |
 
@@ -67,7 +68,7 @@ why, rather than being read wrongly (these cases are covered by
 
 | Kind of file | Error you get |
 |---|---|
-| Compressed images (Rice / GZIP tiles, `.fits.fz`) | With no `hdu`: `the primary HDU holds no image (NAXIS = 0); it contains: [1] SCI (tile-compressed image, not supported yet)`. With `hdu=1`: `HDU 1 (SCI) is a tile-compressed image (ZIMAGE), which is not supported yet` |
+| Tile compression with another algorithm (`HCOMPRESS_1`, `PLIO_1`) | `HDU 1 (SCI): tile-compressed image uses ZCMPTYPE = HCOMPRESS_1 which is not supported yet (supported: RICE_1, GZIP_1, GZIP_2)` |
 | An extension that is a table (catalogue, spectrum...) | `HDU 1 is a BINTABLE table, not an image` |
 | 3-D cubes (`NAXIS = 3`) | `NAXIS = 3 is not supported ...: only 2-D images are handled` |
 | Not a FITS file | `truncated file: no END card found` |
@@ -93,7 +94,7 @@ them, comparing with astropy:
 | MER segmentation maps (`EUC_MER_FINAL-SEGMAP...`) | primary HDU, `BITPIX = 64` | **Stats work** (checked on the real 2.9 GB file: min, max and mean identical to astropy to ~13 digits). No `CD` matrix in the header, so no cutouts |
 | Catalogues, PSF files, other tables | table extensions | Not images, out of scope |
 
-None of the Q1 image files I looked at were tile-compressed.
+None of the Q1 image files I looked at were tile-compressed, so there was no compressed Euclid file to test on. Compressed-image support was validated on copies of real Euclid data that I compressed with astropy/cfitsio (see [Compressed images](#compressed-images)).
 
 To check a file yourself before running anything on it, list its HDUs:
 
@@ -277,6 +278,15 @@ c = euclid_fast.extract_cutout(frame, 266.09, 67.32, 50, 50, hdu="DET11.SCI")
 (names are matched case-insensitively; if several HDUs share a name, the
 first one is used).
 
+**Compressed files** (`.fits.fz`, as written by `fpack`) work the same way: the image is in extension 1, so pass `hdu=1`.
+
+```python
+stats = euclid_fast.fits_stats("image.fits.fz", hdu=1)
+cutout = euclid_fast.extract_cutout("image.fits.fz", 150.0, 2.2, 50, 50, hdu=1)   # decodes only the tiles it needs
+```
+
+Lossy (quantized) floating-point images decode to exactly the values astropy/cfitsio would give, which are not the original pre-compression values; that loss belongs to the format, not to `euclid_fast`.
+
 Reference:
 
 | Function | Returns | Fields |
@@ -300,8 +310,9 @@ as `ValueError`.
 `tests/test_input_validation.py` builds small FITS files with astropy and
 checks that supported files work (primary HDU, extensions, `BITPIX` 16 and
 64, `BZERO`/`BSCALE`), that unsupported ones are rejected with a clear error,
-and that the TPV distortion agrees with astropy/wcslib on a strongly
-distorted synthetic header. It needs no download. With `euclid_fast`
+that the TPV distortion agrees with astropy/wcslib on a strongly distorted
+synthetic header, and that tile-compressed images (`RICE_1`, `GZIP_1`,
+`GZIP_2`, quantization and dithering) decode exactly like astropy/cfitsio. It needs no download. With `euclid_fast`
 installed and `pip install -r scripts/requirements.txt` done:
 
 ```bash
@@ -348,7 +359,7 @@ Optional flags: `--hdu` (the HDU holding the image, an `EXTNAME` or a 0-based
 index; default: the primary HDU), `--ra` / `--dec` (cutout center in degrees;
 default: the sky position of the image center, taken from the file's own
 WCS), `--size` (cutout width and height in pixels, default 50) and `--runs`
-(repetitions per measurement, default 5). If the file has no sky WCS (raw
+(repetitions per measurement, default 5). If the HDU is tile-compressed, astropy has to decompress the whole image for the global stats and reads the cutout through `.section`; the script handles both. If the file has no sky WCS (raw
 detector frames, for example), the cutout comparison is skipped with an
 explanation and the global-stats comparison still runs. If the file uses
 `BZERO`/`BSCALE`, astropy cannot memory-map it and reads it into RAM; the
@@ -391,7 +402,7 @@ loads the file into its cache.
 | `ModuleNotFoundError: No module named 'euclid_fast'` | You are in a different Python than the one you installed into. Activate the virtual environment (`source .venv/bin/activate`) and retry; check with `pip show euclid_fast`. |
 | `ValueError: the primary HDU holds no image (NAXIS = 0); it contains: ...` | The image is in an extension (Euclid calibrated/raw frames). Pass `hdu=` with the name or index shown in the message. |
 | `ValueError: no HDU named '...'` / `no HDU with index ...` | Wrong `hdu` value. The message lists the available HDUs; `euclid_fast.list_hdus(path)` shows them all. |
-| `ValueError: ... is a tile-compressed image` or `... is a BINTABLE table, not an image` | That HDU is compressed or is a table. Compressed images are not supported yet; see [What kind of files does it work with?](#what-kind-of-files-does-it-work-with). |
+| `ValueError: ... tile-compressed image uses ZCMPTYPE = ...` or `... is a BINTABLE table, not an image` | That HDU uses a compression algorithm that is not implemented (only `RICE_1`, `GZIP_1`, `GZIP_2` are), or it is a table. |
 | `ValueError: NAXIS = 3 is not supported` or `no END card found` | A 3-D cube, or a file that is not FITS. Only 2-D images are handled. |
 | `ValueError: unsupported WCS projection ...` | The cutout functions implement the `RA---TAN` / `DEC--TAN` projection and the `RA---TPV` / `DEC--TPV` polynomial distortion. SIN, SIP and other WCS types are not supported yet. |
 | `ValueError: this file has no WCS header` | The cutout functions need `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix in the chosen HDU. `fits_stats` still works without them. |
@@ -482,6 +493,38 @@ operations:
   ceiling on the achievable speedup is lower and both tools get closer to
   it.
 
+### Compressed images
+
+Tile-compressed images (`RICE_1`, `GZIP_1`, `GZIP_2`, with quantized or
+lossless floats) are decoded tile by tile, with the tiles spread over the
+threads; a cutout decodes only the tiles it touches. Results are checked
+against astropy (cfitsio): min/max and every cutout pixel are identical, and
+`mean` agrees to ~10^-9 relative, over 40 test configurations (algorithms,
+pixel types, tile shapes, dither methods and seeds, NaN pixels, unsigned
+16-bit) and on the real Euclid data below.
+
+I had no Euclid-produced compressed file (none of the Q1 images I checked
+were compressed), so the real-data runs use real Euclid images that I
+compressed myself with astropy's `CompImageHDU` (cfitsio underneath), with
+its defaults (quantization level 16, dithering) unless stated:
+
+| Real Euclid data, compressed with astropy | Global stats: `astropy` -> `euclid_fast` | 50×50 cutout: `astropy` (`.section`) -> `euclid_fast` |
+|---|---|---|
+| NISP detector, 2040², `RICE_1` | 78.6 ms -> 14.5 ms (×5.4) | 6.96 ms -> 0.54 ms (×12.9) |
+| NISP detector, `GZIP_2` | 219 ms -> 22.4 ms (×9.8) | 10.5 ms -> 0.80 ms (×13.2) |
+| NISP detector, `GZIP_2` lossless | 176 ms -> 12.8 ms (×13.7) | 8.58 ms -> 0.48 ms (×17.8) |
+| VIS detector, 2048×2066, `RICE_1` | 72.7 ms -> 11.2 ms (×6.5) | 7.37 ms -> 0.46 ms (×15.9) |
+| MER mosaic, 19200², `RICE_1` (1.47 GB -> 308 MB) | 3719 ms -> 1216 ms (×3.06) | 14.96 ms -> 3.71 ms (×4.0) |
+
+Median of 3 runs on the development machine, warm cache. For `astropy`, the
+global stats include decompressing the whole image (single-threaded), which
+is what an astropy user does; the gap is wider than for uncompressed files
+because `euclid_fast` decompresses tiles on all the cores. On the big mosaic
+the tiles are whole image rows (19200 pixels wide), so a cutout still has to
+decode about fifty full rows, which is why the cutout gain is smaller there.
+These are decoding speeds only: the files were produced by cfitsio, and
+Euclid's own compressed products (if any) may use other settings.
+
 ### How the Rust side got there: an honest log of what worked
 
 The speedups above are the result of iterating against measurements, not
@@ -511,12 +554,11 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
 
 ## Known limitations (read before relying on this for science)
 
-- **No compressed-tile support yet.** Only uncompressed FITS data is
-  handled. Rice/GZIP-compressed tiles (used by many archives, although none
-  of the Q1 image files I checked were compressed) require a decompression
-  step that `euclid_fast` does not implement yet; that step necessarily
-  costs a copy, but should still outperform the `cfitsio`/GIL path once
-  added.
+- **Compression: `RICE_1`, `GZIP_1` and `GZIP_2` only.** `HCOMPRESS_1` and
+  `PLIO_1` are not implemented and are refused with a clear error. The
+  compressed files tested were produced by astropy/cfitsio, not by Euclid's
+  pipeline. Compressed cutouts decode whole tiles, so images compressed
+  with very large tiles make cutouts slower.
 - **One image per call.** Each call reads a single HDU of a single file; no
   batch processing across a file list or all the detectors of a frame at once
   (yet — see Roadmap).
@@ -541,7 +583,7 @@ This is the first of four planned components for Euclid-scale data
 processing, chosen first specifically because it needed no GPU/cluster
 and is the foundation the others build on:
 
-1. ✅ **FITS streaming / cutout / Parquet export** (this package). Next steps for this component, in the order I would do them: batch access to many files or all detectors of a frame, SIP distortion, then tile-compressed images (none of the Q1 image files I checked were compressed, so this is not urgent).
+1. ✅ **FITS streaming / cutout / Parquet export** (this package). Next steps for this component, in the order I would do them: batch access to many files or all detectors of a frame, SIP distortion, then the remaining compression algorithms (`HCOMPRESS_1`, `PLIO_1`) if someone needs them.
 2. Catalogue cross-matching at the hundred-million-to-billion-object
    scale (HEALPix / spherical KD-tree indexing, memory-mapped for
    datasets larger than available RAM).

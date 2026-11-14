@@ -1,7 +1,8 @@
 """
 Tests for euclid_fast: supported inputs work, unsupported ones are rejected
-with a clear error (instead of silently giving wrong results), and the TPV
-distortion agrees with astropy/wcslib.
+with a clear error (instead of silently giving wrong results), the TPV
+distortion agrees with astropy/wcslib, and tile-compressed images decode to
+exactly what astropy/cfitsio decodes.
 
 Everything is built from small synthetic FITS files, so no download is needed.
 Run from the project root, in the environment where euclid_fast is installed:
@@ -107,12 +108,20 @@ def test_extensions(tmp):
 
 
 def test_unreadable_hdus(tmp):
+    # A compressed image is readable (see test_compressed_images), but it lives in
+    # an extension: without hdu= the error points at it.
     comp = fits.CompImageHDU(IMG, compression_type="RICE_1", name="SCI")
     p = write(tmp, "compressed.fits", fits.HDUList([fits.PrimaryHDU(), comp]))
-    raises(lambda: euclid_fast.fits_stats(p), "NAXIS = 0", "tile-compressed")
-    raises(lambda: euclid_fast.fits_stats(p, hdu=1), "tile-compressed image (ZIMAGE)")
+    raises(lambda: euclid_fast.fits_stats(p), "NAXIS = 0", "tile-compressed RICE_1", "hdu=")
     info = euclid_fast.list_hdus(p)[1]
-    assert not info.readable and "tile-compressed" in info.note
+    assert info.readable and "tile-compressed RICE_1" in info.note and info.shape == [300, 200]
+
+    # Compression algorithms that are not implemented are refused with a clear message.
+    hc = fits.CompImageHDU(IMG, compression_type="HCOMPRESS_1", name="SCI")
+    p = write(tmp, "hcompress.fits", fits.HDUList([fits.PrimaryHDU(), hc]))
+    raises(lambda: euclid_fast.fits_stats(p, hdu=1), "HCOMPRESS_1", "not supported yet")
+    info = euclid_fast.list_hdus(p)[1]
+    assert not info.readable and "HCOMPRESS_1" in info.note
 
     table = fits.BinTableHDU.from_columns([fits.Column(name="a", format="E", array=np.arange(5, dtype=np.float32))])
     p = write(tmp, "table.fits", fits.HDUList([fits.PrimaryHDU(), table]))
@@ -179,9 +188,71 @@ def test_tpv_matches_astropy(tmp):
     assert shift < 1e-5   # astropy's own round trip is exact, so the reference is sound
 
 
+def _compressed_roundtrip(tmp, name, data, check_mean=True, **kw):
+    """Compress with astropy (cfitsio), then check euclid_fast decodes the same pixels."""
+    hdr = fits.Header()
+    hdr["CTYPE1"], hdr["CTYPE2"] = "RA---TAN", "DEC--TAN"
+    hdr["CRVAL1"], hdr["CRVAL2"] = RA, DEC
+    hdr["CRPIX1"], hdr["CRPIX2"] = data.shape[1] / 2, data.shape[0] / 2
+    hdr["CD1_1"], hdr["CD1_2"], hdr["CD2_1"], hdr["CD2_2"] = -2e-4, 0.0, 0.0, 2e-4
+    p = write(tmp, name, fits.HDUList([fits.PrimaryHDU(), fits.CompImageHDU(data, header=hdr, **kw)]))
+    with fits.open(p) as hl:
+        ref = np.array(hl[1].data).astype(np.float64)
+        wcs = WCS(hl[1].header)
+    s = euclid_fast.fits_stats(p, hdu=1)
+    assert (s.min, s.max) == (float(np.nanmin(ref)), float(np.nanmax(ref))), (name, s.min, s.max)
+    if check_mean:
+        assert abs(s.mean - float(ref.mean())) <= 1e-9 * max(1.0, abs(float(ref.mean()))), name
+    ny, nx = ref.shape
+    for fx, fy in ((0.3, 0.25), (0.62, 0.5), (0.5, 0.8), (0.85, 0.6)):       # tile borders, off-center
+        ra, dec = wcs.all_pix2world(fx * nx, fy * ny, 1)
+        c = euclid_fast.extract_cutout(p, float(ra), float(dec), 17, 13, hdu=1)
+        x0 = int(round(c.pixel_x_center - 1 - 17 / 2)); y0 = int(round(c.pixel_y_center - 1 - 13 / 2))
+        got = np.array(c.data).reshape(13, 17)
+        assert np.array_equal(got, ref[y0:y0 + 13, x0:x0 + 17], equal_nan=True), (name, "cutout", fx, fy)
+
+
+def test_compressed_images(tmp):
+    # Tile-compressed images (RICE_1, GZIP_1, GZIP_2), with and without float
+    # quantization/dithering, against astropy (which uses cfitsio). The image
+    # size is not a multiple of the tile size, to exercise the edge tiles.
+    rng = np.random.default_rng(11)
+    h, w = 203, 317
+    ints = {
+        "uint8": rng.integers(0, 255, (h, w)).astype(np.uint8),
+        "int16": (rng.normal(0, 400, (h, w)) + np.linspace(-3000, 3000, w)).astype(np.int16),
+        "int32": (rng.normal(0, 5e4, (h, w)) + np.linspace(-1e6, 1e6, w)).astype(np.int32),
+        "uint16": rng.integers(0, 65535, (h, w)).astype(np.uint16),       # BZERO = 32768
+    }
+    flt = (rng.normal(100, 7, (h, w)) + 50 * np.sin(np.linspace(0, 20, w))).astype(np.float32)
+    flt_nan = flt.copy(); flt_nan[rng.random((h, w)) < 0.03] = np.nan; flt_nan[:20, :30] = np.nan
+    n = 0
+    for dtype, data in ints.items():
+        for algo in ("RICE_1", "GZIP_1", "GZIP_2"):
+            _compressed_roundtrip(tmp, f"i{n}.fits", data, compression_type=algo); n += 1
+    _compressed_roundtrip(tmp, f"i{n}.fits", ints["int16"], compression_type="RICE_1", tile_shape=(37, 41)); n += 1
+    _compressed_roundtrip(tmp, f"i{n}.fits", ints["int32"], compression_type="RICE_1", tile_shape=(64, 64)); n += 1
+    for algo in ("RICE_1", "GZIP_1", "GZIP_2"):
+        for method in (0, 1, 2):                      # NO_DITHER, SUBTRACTIVE_DITHER_1, _2
+            _compressed_roundtrip(tmp, f"f{n}.fits", flt, compression_type=algo, quantize_method=method,
+                                  dither_seed=17); n += 1
+    for seed in (1, 777, 10000, -1):                  # -1 = checksum-based seed
+        _compressed_roundtrip(tmp, f"f{n}.fits", flt, compression_type="RICE_1", quantize_method=1,
+                              dither_seed=seed); n += 1
+    _compressed_roundtrip(tmp, f"f{n}.fits", flt, compression_type="RICE_1", quantize_method=1,
+                          dither_seed=123, tile_shape=(40, 50)); n += 1
+    _compressed_roundtrip(tmp, f"f{n}.fits", flt.astype(np.float64), compression_type="RICE_1"); n += 1
+    _compressed_roundtrip(tmp, f"f{n}.fits", flt_nan, check_mean=False, compression_type="RICE_1",
+                          quantize_method=1, dither_seed=9); n += 1
+    for algo in ("GZIP_1", "GZIP_2"):                 # lossless float (no quantization)
+        _compressed_roundtrip(tmp, f"f{n}.fits", flt, compression_type=algo, quantize_level=0.0); n += 1
+        _compressed_roundtrip(tmp, f"f{n}.fits", flt.astype(np.float64), compression_type=algo,
+                              quantize_level=0.0); n += 1
+
+
 def test_all():
     for fn in (test_supported_primary, test_int64, test_extensions, test_unreadable_hdus,
-               test_rejected_inputs, test_tpv_matches_astropy):
+               test_rejected_inputs, test_tpv_matches_astropy, test_compressed_images):
         with tempfile.TemporaryDirectory() as tmp:
             fn(tmp)
             print("ok  ", fn.__name__)
