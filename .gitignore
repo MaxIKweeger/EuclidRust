@@ -13,3 +13,6 @@ __pycache__/
 
 # Build Rust (déjà couvert dans euclid_fast/.gitignore, redondance ok)
 euclid_fast/target/
+
+# Personal notes, not part of the public repo
+base.txt
