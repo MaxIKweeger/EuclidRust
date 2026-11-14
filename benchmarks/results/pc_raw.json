@@ -1,0 +1,48 @@
+{
+  "machine": {
+    "label": "i9 (PC)",
+    "os": "Windows 11",
+    "python": "3.12.10",
+    "cpu": "Intel(R) Core(TM) i9-10850K CPU @ 3.60GHz",
+    "cpu_threads": 20,
+    "ram_gib": 63.8
+  },
+  "workload": "raw tile",
+  "file": {
+    "name": "euclid_real_Y.fits",
+    "size_bytes": 1474565760,
+    "hdu": null,
+    "compressed": false
+  },
+  "runs": 9,
+  "euclidrust_threads": 20,
+  "stats": {
+    "astropy_ms": 1299.2023000006157,
+    "euclidrust_cpu_ms": 125.08059999890975,
+    "astropy_result": [
+      -111.43283081054688,
+      15220.939453125,
+      1.0181564092636108
+    ],
+    "euclidrust_result": [
+      -111.43283081054688,
+      15220.939453125,
+      1.0181568676826722
+    ],
+    "gpu": {
+      "available": true,
+      "name": "NVIDIA GeForce RTX 4070 Ti",
+      "memory_mb": 12281,
+      "end_to_end_ms": 243.11519999901066,
+      "matches_cpu": true,
+      "upload_ms": 264.79789999999997,
+      "resident_ms": 10.310999998182524
+    }
+  },
+  "cutout": {
+    "size": 50,
+    "astropy_ms": 3.560100001777755,
+    "euclidrust_cpu_ms": 0.274800000624964,
+    "identical_pixels": true
+  }
+}

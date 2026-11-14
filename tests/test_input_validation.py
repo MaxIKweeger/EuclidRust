@@ -198,6 +198,88 @@ def test_lookup_table_distortion_is_refused(tmp):
         raises(lambda: cutout(p), "lookup tables")
 
 
+def _same_on_gpu(cpu, gpu, label):
+    assert (cpu.min, cpu.max, cpu.n_nan) == (gpu.min, gpu.max, gpu.n_nan), (label, cpu.min, gpu.min, cpu.max, gpu.max)
+    assert abs(cpu.mean - gpu.mean) <= 1e-9 * max(1.0, abs(cpu.mean)), (label, cpu.mean, gpu.mean)
+    assert gpu.device != "cpu", label
+
+
+def test_gpu(tmp):
+    # With or without an NVIDIA GPU, the module reports it and chooses sensibly.
+    info = euclidrust.gpu_info()
+    assert isinstance(info.available, bool) and isinstance(info.message, str) and info.message
+    assert euclidrust.gpu_available() == info.available
+    h = fits.PrimaryHDU(IMG)
+    raw = write(tmp, "device_raw.fits", fits.HDUList([h]))
+    assert euclidrust.fits_stats(raw, device="cpu").device == "cpu"
+    assert euclidrust.fits_stats(raw).device == "cpu"                 # raw images stay on the CPU in auto mode
+    assert euclidrust.fits_stats(raw, device="auto").device == "cpu"
+    raises(lambda: euclidrust.fits_stats(raw, device="quantum"), "unknown device", "'cpu', 'gpu' or 'auto'")
+    if not info.available:
+        raises(lambda: euclidrust.fits_stats(raw, device="gpu"), "GPU:")
+        raises(lambda: euclidrust.GpuImage(raw), "GPU:")
+        return
+
+    # --- a GPU is usable: it must give the CPU's answers, for every pixel type ---
+    rng = np.random.default_rng(8)
+    images = {
+        "uint8": rng.integers(0, 255, (300, 400)).astype(np.uint8),
+        "int16": (rng.normal(0, 900, (300, 400))).astype(np.int16),
+        "int32": (rng.normal(0, 5e6, (300, 400))).astype(np.int32),
+        "float32": rng.normal(100, 7, (300, 400)).astype(np.float32),
+        "float64": rng.normal(-3, 2, (300, 400)),
+    }
+    nan_img = images["float32"].copy()
+    nan_img[rng.random(nan_img.shape) < 0.05] = np.nan
+    images["float32 with NaN"] = nan_img
+    for name, arr in images.items():
+        hh = fits.PrimaryHDU(arr)
+        if name == "int16":
+            hh.header["BZERO"], hh.header["BSCALE"] = 32.5, 0.25
+        p = write(tmp, f"gpu_{len(name)}{name[0]}{arr.dtype}.fits", fits.HDUList([hh]))
+        cpu = euclidrust.fits_stats(p, device="cpu")
+        _same_on_gpu(cpu, euclidrust.fits_stats(p, device="gpu"), name)
+        _same_on_gpu(cpu, euclidrust.GpuImage(p).stats(), name + " (resident)")
+    # all-NaN image: no valid pixel
+    allnan = write(tmp, "gpu_allnan.fits", fits.HDUList([fits.PrimaryHDU(np.full((20, 30), np.nan, np.float32))]))
+    s = euclidrust.fits_stats(allnan, device="gpu")
+    assert np.isnan(s.mean) and s.n_nan == 600
+
+    # an image longer than the 64 MiB staging buffers: the copy is done in several pieces
+    big = rng.normal(5, 3, (4400, 4000)).astype(np.float32)
+    big[::97, ::89] = np.nan
+    pb = write(tmp, "gpu_big.fits", fits.HDUList([fits.PrimaryHDU(big)]))
+    cpu = euclidrust.fits_stats(pb, device="cpu")
+    for _ in range(3):                                                    # repeated: no leftover state, no race
+        _same_on_gpu(cpu, euclidrust.fits_stats(pb, device="gpu"), "big image")
+    res = euclidrust.GpuImage(pb)
+    assert res.shape == (4000, 4400) and res.nbytes == big.nbytes
+    _same_on_gpu(cpu, res.stats(), "big image, resident")
+
+    # --- Rice-compressed images are decoded on the card, to exactly the same numbers ---
+    ints = {"int16": (rng.normal(0, 400, (200, 300))).astype(np.int16), "uint8": rng.integers(0, 255, (200, 300)).astype(np.uint8),
+            "int32": (rng.normal(0, 5e4, (200, 300))).astype(np.int32), "uint16": rng.integers(0, 65535, (200, 300)).astype(np.uint16)}
+    flt = rng.normal(100, 7, (200, 300)).astype(np.float32)
+    flt_nan = flt.copy()
+    flt_nan[rng.random(flt.shape) < 0.04] = np.nan
+    cases = [(f"int {k}", v, {}) for k, v in ints.items()]
+    cases += [(f"float32 dither {m}", flt, {"quantize_method": m, "dither_seed": 17}) for m in (0, 1, 2)]
+    cases += [("float32 NaN", flt_nan, {"quantize_method": 1, "dither_seed": 9}), ("float32 tiles 40x50", flt, {"quantize_method": 1, "dither_seed": 3, "tile_shape": (40, 50)}),
+              ("float64", flt.astype(np.float64), {"quantize_method": 2, "dither_seed": 10000})]
+    for k, (name, arr, kw) in enumerate(cases):
+        p = write(tmp, f"gpu_rice{k}.fits", fits.HDUList([fits.PrimaryHDU(), fits.CompImageHDU(arr, compression_type="RICE_1", **kw)]))
+        cpu = euclidrust.fits_stats(p, hdu=1, device="cpu")
+        _same_on_gpu(cpu, euclidrust.fits_stats(p, hdu=1, device="gpu"), "Rice " + name)
+    # what the card cannot do is refused with a reason, and `auto` quietly uses the CPU
+    gz = write(tmp, "gpu_gzip.fits", fits.HDUList([fits.PrimaryHDU(), fits.CompImageHDU(flt, compression_type="GZIP_2")]))
+    raises(lambda: euclidrust.fits_stats(gz, hdu=1, device="gpu"), "GPU:", "Rice")
+    assert euclidrust.fits_stats(gz, hdu=1).device == "cpu"
+    i64 = write(tmp, "gpu_i64.fits", fits.HDUList([fits.PrimaryHDU(np.arange(100, dtype=np.int64).reshape(10, 10))]))
+    raises(lambda: euclidrust.fits_stats(i64, device="gpu"), "GPU:", "64")
+    assert euclidrust.fits_stats(i64).max_int == 99                      # `auto` gives the exact CPU answer
+    raises(lambda: euclidrust.GpuImage(gz, hdu=1), "GPU:", "tile-compressed")
+
+
 def test_extensions(tmp):
     # Layout of Euclid calibrated frames: empty primary, one image per extension.
     sci = fits.ImageHDU(IMG, name="DET11.SCI"); add_wcs(sci.header)
@@ -534,7 +616,7 @@ def test_batch(tmp):
 
 def test_all():
     for fn in (test_supported_primary, test_int64, test_extensions, test_unreadable_hdus,
-               test_int64_exact, test_int64_exact_more, test_nan_pixels, test_lookup_table_distortion_is_refused, test_rejected_inputs, test_tpv_matches_astropy, test_wcs_matches_astropy,
+               test_int64_exact, test_int64_exact_more, test_nan_pixels, test_gpu, test_lookup_table_distortion_is_refused, test_rejected_inputs, test_tpv_matches_astropy, test_wcs_matches_astropy,
                test_compressed_images, test_batch):
         with tempfile.TemporaryDirectory() as tmp:
             fn(tmp)

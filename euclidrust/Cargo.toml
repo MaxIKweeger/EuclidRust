@@ -18,6 +18,15 @@ num_cpus = "1"
 parquet = { version = "60", features = ["arrow"] }
 arrow-array = "60"
 flate2 = "1"
+# NVIDIA GPU backend. The CUDA driver is loaded at run time, so building and running with the
+# feature do not require CUDA (or even an NVIDIA card) to be installed.
+cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc", "dynamic-loading", "std", "cuda-13030"], optional = true }
+
+[features]
+# One build serves every machine: the NVIDIA libraries are loaded when needed, so the same
+# binary uses a GPU if there is one and the CPU if not. `--no-default-features` leaves CUDA out.
+default = ["cuda"]
+cuda = ["dep:cudarc"]
 
 # Max performance: full LTO and a single codegen unit (better cross-function
 # optimisation; slower to compile, faster binary). `panic = "abort"` is not

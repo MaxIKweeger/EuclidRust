@@ -1,11 +1,13 @@
 use flate2::read::GzDecoder;
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::Read;
 use std::sync::OnceLock;
+
+mod gpu;
 
 const CARD_LEN: usize = 80;
 const BLOCK_LEN: usize = 2880; // 36 cards of 80 bytes
@@ -721,6 +723,20 @@ fn be_u64(b: &[u8]) -> u64 {
     u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
+/// (number of bytes, offset in the heap) of the variable-length cell of table row `row`.
+fn heap_descriptor(t: &Tiled, mmap: &[u8], col: &Column, row: usize) -> PyResult<(usize, usize)> {
+    let base = t.table_offset + row * t.row_len + col.offset;
+    let width = if col.wide { 16 } else { 8 };
+    if base + width > mmap.len() {
+        return err("truncated file: the compressed-image table is cut short");
+    }
+    Ok(if col.wide {
+        (be_u64(&mmap[base..]) as usize, be_u64(&mmap[base + 8..]) as usize)
+    } else {
+        (be_u32(&mmap[base..]) as usize, be_u32(&mmap[base + 4..]) as usize)
+    })
+}
+
 /// The bytes a variable-length column points to for table row `row`.
 fn heap_bytes<'a>(t: &Tiled, mmap: &'a [u8], col: &Column, row: usize) -> PyResult<&'a [u8]> {
     let base = t.table_offset + row * t.row_len + col.offset;
@@ -1174,6 +1190,18 @@ fn open_mmap(path: &str) -> PyResult<Mmap> {
     unsafe { Mmap::map(&file).map_err(|e| PyValueError::new_err(format!("mmap failed: {e}"))) }
 }
 
+/// Maps `len` bytes of `file` starting at `offset` (which need not be aligned) and hands them to
+/// `f`. The mapping is released as soon as `f` returns. Mapping many small windows in parallel,
+/// instead of one big view of the whole file, spreads the cost of tearing the mappings down
+/// across the threads (on Windows that cost is large and is not parallel for a single view).
+pub(crate) fn with_window<R>(file: &File, offset: u64, len: usize, f: impl FnOnce(&[u8]) -> R) -> std::io::Result<R> {
+    const GRANULARITY: u64 = 1 << 16; // mapping offsets must be a multiple of this on every OS
+    let start = offset / GRANULARITY * GRANULARITY;
+    let delta = (offset - start) as usize;
+    let map = unsafe { MmapOptions::new().offset(start).len(delta + len).map(file)? };
+    Ok(f(&map[delta..delta + len]))
+}
+
 /// One HDU of a FITS file, as reported by `list_hdus`.
 #[pyclass]
 struct HduInfo {
@@ -1296,6 +1324,12 @@ struct FitsStats {
     threads_used: usize,
     #[pyo3(get)]
     elapsed_ms: f64,
+    #[pyo3(get)]
+    device: String, // "cpu", or the name of the GPU that computed the statistics
+    #[pyo3(get)]
+    upload_ms: Option<f64>, // GPU only: time spent copying the image to the card
+    #[pyo3(get)]
+    kernel_ms: Option<f64>, // GPU only: time spent computing on the card
 }
 
 /// (min, max, sum of the valid values, number of NaN pixels) of a slice of
@@ -1360,14 +1394,27 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
             return err("truncated file: fewer pixels than the header announces");
         }
         let data = &mmap[header.data_offset..data_end];
+        // On Windows the pixels are read with positioned reads rather than through the file
+        // mapping, whose teardown is very slow there (see `reduce_file`).
+        let use_reads = cfg!(windows);
+        macro_rules! reduce {
+            ($t:ty) => {
+                if use_reads {
+                    reduce_file::<$t>(path, header.data_offset as u64, data_end - header.data_offset, header.bzero, header.bscale)
+                        .map_err(|e| PyValueError::new_err(format!("cannot read {path}: {e}")))?
+                } else {
+                    reduce_be_checked::<$t>(data, header.bzero, header.bscale)
+                }
+            };
+        }
 
         // Read + convert to "physical" f64 (BZERO + BSCALE * raw_value), in
         // parallel over chunks of pixels. rayon sizes the number of threads
         // itself from the machine's logical core count.
         match header.bitpix {
-            16 => take(reduce_be_checked::<i16>(data, header.bzero, header.bscale)),
-            8 => take(reduce_be_checked::<u8>(data, header.bzero, header.bscale)),
-            32 => take(reduce_be_checked::<i32>(data, header.bzero, header.bscale)),
+            16 => take(reduce!(i16)),
+            8 => take(reduce!(u8)),
+            32 => take(reduce!(i32)),
             64 => match int64_affine(header.bzero, header.bscale) {
                 // Exact integer arithmetic: BZERO and BSCALE are applied as integers, so
                 // unsigned 64-bit data (BZERO = 2^63) and values above 2^53 stay exact.
@@ -1376,10 +1423,10 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
                     exact = Some((mn, mx));
                     (mn as f64, mx as f64, sm as f64)
                 }
-                None => take(reduce_be_checked::<i64>(data, header.bzero, header.bscale)),
+                None => take(reduce!(i64)),
             },
-            -32 => take(reduce_be_checked::<f32>(data, header.bzero, header.bscale)),
-            -64 => take(reduce_be_checked::<f64>(data, header.bzero, header.bscale)),
+            -32 => take(reduce!(f32)),
+            -64 => take(reduce!(f64)),
             other => return err(format!("BITPIX {other} is not supported yet")),
         }
     };
@@ -1401,6 +1448,9 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
         n_nan: nan_count,
         threads_used: rayon::current_num_threads(),
         elapsed_ms,
+        device: "cpu".to_string(),
+        upload_ms: None,
+        kernel_ms: None,
     })
 }
 
@@ -1412,11 +1462,15 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
 /// number of cores available on the machine (no hardcoded value). The GIL is
 /// released while Rust works, so other Python threads keep running. `hdu`
 /// selects the HDU by 0-based index or EXTNAME; by default the primary HDU is
-/// read.
+/// read. `device` is "cpu", "gpu" (an NVIDIA GPU, an error if there is none) or
+/// "auto" (the GPU when one is usable and the image is one the GPU is good at, the CPU
+/// otherwise); when it is not given, the environment variable `EUCLIDRUST_DEVICE` is
+/// used, then "auto".
 #[pyfunction]
-#[pyo3(signature = (path, hdu=None))]
-fn fits_stats(python: Python<'_>, path: &str, hdu: Option<HduSelector>) -> PyResult<FitsStats> {
-    python.detach(|| stats_impl(path, &hdu))
+#[pyo3(signature = (path, hdu=None, device=None))]
+fn fits_stats(python: Python<'_>, path: &str, hdu: Option<HduSelector>, device: Option<&str>) -> PyResult<FitsStats> {
+    let device = gpu::Device::parse(device)?;
+    python.detach(|| gpu::stats_with_device(path, &hdu, device))
 }
 
 /// Statistics of one HDU, as returned by `fits_stats_all_hdus`.
@@ -1578,88 +1632,101 @@ impl BigEndianSample for f64 {
     }
 }
 
-/// Fast path of the parallel reduction: (min, max, sum) over the raw pixels of
-/// type T, with no per-pixel NaN bookkeeping (NaN pixels simply never win a
-/// min / max comparison, but they turn the sum into NaN).
-fn reduce_be<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) -> (f64, f64, f64) {
-    const CHUNK_PIXELS: usize = 1 << 16; // 65536 pixels per rayon block
-    let chunk_bytes = CHUNK_PIXELS * T::SIZE;
+/// Pixels per block of the parallel reductions (65536: one block per rayon task).
+const BLOCK_PIXELS: usize = 1 << 16;
+type Acc = (f64, f64, f64, usize); // (min, max, sum of the valid values, number of NaN pixels)
+const ACC_ZERO: Acc = (f64::INFINITY, f64::NEG_INFINITY, 0.0, 0);
 
-    data.par_chunks(chunk_bytes.max(T::SIZE))
-        .map(|chunk| {
-            let n = chunk.len() / T::SIZE;
-            let mut mn = f64::INFINITY;
-            let mut mx = f64::NEG_INFINITY;
-            let mut sum = 0.0_f64;
-            for i in 0..n {
-                let off = i * T::SIZE;
-                let v = bzero + bscale * T::from_be_slice(&chunk[off..off + T::SIZE]);
-                if v < mn {
-                    mn = v;
-                }
-                if v > mx {
-                    mx = v;
-                }
-                sum += v;
-            }
-            (mn, mx, sum)
-        })
-        .reduce(
-            || (f64::INFINITY, f64::NEG_INFINITY, 0.0_f64),
-            |(mn1, mx1, s1), (mn2, mx2, s2)| (mn1.min(mn2), mx1.max(mx2), s1 + s2),
-        )
+fn merge(a: Acc, b: Acc) -> Acc {
+    (a.0.min(b.0), a.1.max(b.1), a.2 + b.2, a.3 + b.3)
 }
 
-/// (min, max, sum of the valid pixels, number of NaN pixels). Takes the fast
-/// path, and only when its sum is NaN (the image has NaN pixels) pays for a
-/// second, NaN-aware pass.
-fn reduce_be_checked<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) -> (f64, f64, f64, usize) {
-    let (mn, mx, sum) = reduce_be::<T>(data, bzero, bscale);
-    if sum.is_nan() {
-        reduce_be_nan::<T>(data, bzero, bscale)
-    } else {
-        (mn, mx, sum, 0)
+/// (min, max, sum) of one block of raw pixels, as physical values. NaN pixels never win a
+/// comparison but turn the sum into NaN: the caller falls back to `block_nan` for that block.
+/// The loop is a tight sequential one, the kind LLVM auto-vectorizes best.
+fn block_fast<T: BigEndianSample>(chunk: &[u8], bzero: f64, bscale: f64) -> (f64, f64, f64) {
+    let n = chunk.len() / T::SIZE;
+    let mut mn = f64::INFINITY;
+    let mut mx = f64::NEG_INFINITY;
+    let mut sum = 0.0_f64;
+    for i in 0..n {
+        let off = i * T::SIZE;
+        let v = bzero + bscale * T::from_be_slice(&chunk[off..off + T::SIZE]);
+        if v < mn {
+            mn = v;
+        }
+        if v > mx {
+            mx = v;
+        }
+        sum += v;
     }
+    (mn, mx, sum)
 }
 
-/// Parallel reduction (min, max, sum) over the raw pixels of type T,
-/// applying BZERO/BSCALE to get the physical value.
-///
-/// v2: instead of handing rayon a per-pixel iterator (per-element
-/// scheduling/fold overhead), the data is split into large blocks
-/// (`par_chunks`), each processed by a tight sequential loop -- the loop
-/// style LLVM auto-vectorizes best (implicit SIMD, no explicit intrinsics,
-/// no nightly) -- while keeping parallelism across blocks via rayon.
-fn reduce_be_nan<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) -> (f64, f64, f64, usize) {
-    const CHUNK_PIXELS: usize = 1 << 16; // 65536 pixels per rayon block
-    let chunk_bytes = CHUNK_PIXELS * T::SIZE;
+/// The same with NaN pixels left out of the sum and counted.
+fn block_nan<T: BigEndianSample>(chunk: &[u8], bzero: f64, bscale: f64) -> Acc {
+    let n = chunk.len() / T::SIZE;
+    let mut acc = ACC_ZERO;
+    for i in 0..n {
+        let off = i * T::SIZE;
+        let v = bzero + bscale * T::from_be_slice(&chunk[off..off + T::SIZE]);
+        if v == v {
+            acc.0 = acc.0.min(v);
+            acc.1 = acc.1.max(v);
+            acc.2 += v;
+        } else {
+            acc.3 += 1;
+        }
+    }
+    acc
+}
 
-    data.par_chunks(chunk_bytes.max(T::SIZE))
-        .map(|chunk| {
-            let n = chunk.len() / T::SIZE;
-            let mut mn = f64::INFINITY;
-            let mut mx = f64::NEG_INFINITY;
-            let mut sum = 0.0_f64;
-            let mut nans = 0usize;
-            for i in 0..n {
-                let off = i * T::SIZE;
-                let v = bzero + bscale * T::from_be_slice(&chunk[off..off + T::SIZE]);
-                let ok = v == v; // false for NaN
-                if v < mn {
-                    mn = v;
-                }
-                if v > mx {
-                    mx = v;
-                }
-                sum += if ok { v } else { 0.0 };
-                nans += (!ok) as usize;
-            }
-            (mn, mx, sum, nans)
-        })
-        .reduce(
-            || (f64::INFINITY, f64::NEG_INFINITY, 0.0_f64, 0usize),
-            |(mn1, mx1, s1, n1), (mn2, mx2, s2, n2)| (mn1.min(mn2), mx1.max(mx2), s1 + s2, n1 + n2),
+/// One block: the fast loop, and only if its sum is NaN (the block has NaN pixels) the NaN-aware one.
+fn block_adaptive<T: BigEndianSample>(chunk: &[u8], bzero: f64, bscale: f64) -> Acc {
+    let (mn, mx, sum) = block_fast::<T>(chunk, bzero, bscale);
+    if sum.is_nan() { block_nan::<T>(chunk, bzero, bscale) } else { (mn, mx, sum, 0) }
+}
+
+/// Parallel reduction over the raw pixels of type T held in memory (the file mapping), applying
+/// BZERO/BSCALE to get the physical value. Instead of handing rayon a per-pixel iterator, the
+/// data is split into large blocks, each reduced by a tight sequential loop.
+fn reduce_be_checked<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) -> Acc {
+    data.par_chunks((BLOCK_PIXELS * T::SIZE).max(T::SIZE))
+        .map(|c| block_adaptive::<T>(c, bzero, bscale))
+        .reduce(|| ACC_ZERO, merge)
+}
+
+/// The same reduction, reading the file with positioned reads in parallel (one handle per
+/// thread) instead of going through a file mapping. On Windows, closing a mapping that has
+/// been read costs about 165 ms per 1.5 GB, more than the whole computation.
+fn reduce_file<T: BigEndianSample + Sync>(
+    path: &str,
+    offset: u64,
+    n_bytes: usize,
+    bzero: f64,
+    bscale: f64,
+) -> std::io::Result<Acc> {
+    const READ_BYTES: usize = 8 << 20; // a multiple of every sample size
+    let n_chunks = n_bytes.div_ceil(READ_BYTES);
+    (0..n_chunks)
+        .into_par_iter()
+        .map_init(
+            || (File::open(path), vec![0u8; READ_BYTES]),
+            |(file, buf), i| -> std::io::Result<Acc> {
+                let _ = &buf;
+                let file = file.as_ref().map_err(|e| std::io::Error::new(e.kind(), e.to_string()))?;
+                let start = i * READ_BYTES;
+                let len = READ_BYTES.min(n_bytes - start);
+                with_window(file, offset + start as u64, len, |window| {
+                    let mut acc = ACC_ZERO;
+                    for sub in window.chunks((BLOCK_PIXELS * T::SIZE).max(T::SIZE)) {
+                        acc = merge(acc, block_adaptive::<T>(sub, bzero, bscale));
+                    }
+                    acc
+                })
+            },
         )
+        .try_reduce(|| ACC_ZERO, |a, b| Ok(merge(a, b)))
 }
 
 /// BZERO and BSCALE as whole numbers, when the physical value of a 64-bit integer
@@ -2315,6 +2382,11 @@ fn euclidrust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fits_stats_all_hdus, m)?)?;
     m.add_function(wrap_pyfunction!(extract_cutouts, m)?)?;
     m.add_function(wrap_pyfunction!(detected_cpus, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu::gpu_info, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu::gpu_available, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu::_compile_kernels_ptx, m)?)?;
+    m.add_class::<gpu::GpuInfo>()?;
+    m.add_class::<gpu::GpuImage>()?;
     m.add_class::<FitsStats>()?;
     m.add_class::<Cutout>()?;
     m.add_class::<ParquetExport>()?;

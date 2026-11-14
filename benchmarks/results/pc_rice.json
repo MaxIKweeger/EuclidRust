@@ -1,0 +1,47 @@
+{
+  "machine": {
+    "label": "i9 (PC)",
+    "os": "Windows 11",
+    "python": "3.12.10",
+    "cpu": "Intel(R) Core(TM) i9-10850K CPU @ 3.60GHz",
+    "cpu_threads": 20,
+    "ram_gib": 63.8
+  },
+  "workload": "Rice-compressed tile",
+  "file": {
+    "name": "euclid_real_Y_rice.fits",
+    "size_bytes": 308450880,
+    "hdu": 1,
+    "compressed": true
+  },
+  "runs": 7,
+  "euclidrust_threads": 20,
+  "stats": {
+    "astropy_ms": 4074.481799998466,
+    "euclidrust_cpu_ms": 393.21400000335416,
+    "astropy_result": [
+      -111.43427276611328,
+      15220.935546875,
+      1.0181564092636108
+    ],
+    "euclidrust_result": [
+      -111.43427276611328,
+      15220.935546875,
+      1.0181564167717663
+    ],
+    "gpu": {
+      "available": true,
+      "name": "NVIDIA GeForce RTX 4070 Ti",
+      "memory_mb": 12281,
+      "end_to_end_ms": 75.43889999942621,
+      "matches_cpu": true,
+      "unsupported": "GPU: a tile-compressed image cannot be kept on the GPU: it is decoded tile by tile as it is used"
+    }
+  },
+  "cutout": {
+    "size": 50,
+    "astropy_ms": 19.441500000539236,
+    "euclidrust_cpu_ms": 2.631800001836382,
+    "identical_pixels": true
+  }
+}

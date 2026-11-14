@@ -26,6 +26,7 @@ euclidrust.export_cutout_parquet("tile.fits", 83.82, -5.39, 50, 50, "cutout.parq
 [Install](#install) ·
 [Use it](#use-it) ·
 [Many images at once](#many-images-at-once) ·
+[NVIDIA GPU](#using-an-nvidia-gpu) ·
 [Tests](#run-the-tests-optional) ·
 [Run the benchmark](#run-the-benchmark-on-your-own-fits-file) ·
 [Troubleshooting](#troubleshooting) ·
@@ -213,7 +214,7 @@ cd EuclidRust
 python3 -m venv .venv                 # a private Python environment
 source .venv/bin/activate             # Windows PowerShell: .venv\Scripts\Activate.ps1
 
-pip install ./euclidrust             # compiles the Rust code (a few minutes)
+pip install ./euclidrust             # compiles the Rust code (a few minutes); GPU support is included
 ```
 
 The first compile takes a few minutes because the release profile enables
@@ -369,6 +370,95 @@ frames with many small HDUs). On big or compressed files a single call
 already uses all the cores, so a batch call is barely faster than a loop;
 the large gain over astropy there comes from reading and decoding in
 parallel, not from batching.
+
+## Using an NVIDIA GPU
+
+`euclidrust` is **one binary for every machine**. When a computation could use an NVIDIA
+GPU, it looks for one; if there is none (or the driver is missing, or the card is too old) it
+uses the CPU and gives the same answers. There is no separate "GPU build" and nothing to
+install besides the NVIDIA driver you already have to display graphics: **the CUDA toolkit
+is not needed**, because the GPU programs are built into the library.
+
+```python
+euclidrust.gpu_info()
+# <GpuInfo available=yes name="NVIDIA GeForce RTX 4070 Ti" compute_capability=8.9 memory=12281 MB (11056 MB free)>
+# or: <GpuInfo available=no (no NVIDIA driver found (nvcuda.dll / libcuda.so is missing))>
+
+euclidrust.fits_stats(path)                   # device="auto" is the default: the library chooses
+euclidrust.fits_stats(path, device="cpu")     # always the CPU
+euclidrust.fits_stats(path, device="gpu")     # always the GPU; a ValueError says why if it cannot
+s = euclidrust.fits_stats(path); print(s.device)   # "cpu" or the name of the GPU that computed it
+
+img = euclidrust.GpuImage(path)               # copy an image to the card once...
+img.stats(); img.stats()                      # ...then compute on it with no copy at all
+```
+
+The environment variable `EUCLIDRUST_DEVICE` (`cpu`, `gpu` or `auto`) sets the default for a
+whole program, for example `EUCLIDRUST_DEVICE=cpu` to keep everything on the CPU.
+
+### What `auto` decides, and what the GPU is good at
+
+| Image | `auto` uses | Why |
+|---|---|---|
+| Rice-compressed (`RICE_1`), at least 256 tiles and 64 MB | **the GPU** | Only the compressed data (five times smaller) crosses the PCIe bus, and decoding thousands of tiles in parallel is what a GPU does well: one GPU thread decodes one tile and accumulates its statistics, without ever storing the decompressed image |
+| Raw (uncompressed) | the CPU | The 1.47 GB tile has to cross the PCIe bus and the host memory twice, which costs more than the whole CPU computation |
+| Anything else (gzip, lossless floats, 64-bit integers, small files) | the CPU | Not implemented on the GPU, or too small to repay starting CUDA (about 0.1 s, once per process) |
+
+Measured on the Euclid Q1 tile used throughout this README (milliseconds, median, lower is
+better; the full table, with the machines, is in
+[`benchmarks/COMPARISON.md`](benchmarks/COMPARISON.md)):
+
+| | astropy CPU i7 | astropy CPU i9 | EuclidRust CPU i7 NUC | EuclidRust CPU i9 | Euclid GPU RTX 4070 Ti |
+|---|---|---|---|---|---|
+| Raw tile 1.47 GB: min / max / mean | 478 | 1,299 | 132 | 125 | 243 |
+| same, image already on the GPU | | | | | **10.3** |
+| 50×50 cutout (always on the CPU) | 2.70 | 3.56 | 0.22 | 0.27 | (CPU) |
+| Rice-compressed tile 0.31 GB: min / max / mean | 3,603 | 4,074 | 1,211 | 393 | **75** |
+| 50×50 cutout (always on the CPU) | 17.1 | 19.4 | 3.55 | 2.63 | (CPU) |
+
+What to take from it:
+
+- **Compressed images: the GPU is the clear winner**, 5.2 times faster than the same code on the
+  20-thread CPU, and 54 times faster than astropy, with **identical results** (minimum,
+  maximum and mean agree to the last digit, the GPU running the same arithmetic as the CPU
+  code).
+- **Raw images, one computation: the GPU is slower than the CPU** here (243 ms against 125 ms).
+  This PC's CPU only offers PCIe 3.0 (12.9 GB/s measured, so 114 ms at best just to move the
+  data) and the file has to be read into page-locked memory first. Once the image is on the
+  card, the computation takes **10 ms**, 12 times faster than the CPU: that is where
+  `GpuImage` pays, when you compute several things on the same image.
+- Cutouts, batches and everything else run on the CPU.
+- Astropy has no GPU support at all (it is single-threaded C code); a Python user who wants a
+  GPU today has to read the data with astropy and send it to another library.
+
+### Requirements and honest limits
+
+- **Hardware and driver:** an NVIDIA GPU of compute capability 7.5 or higher (RTX 20 series and
+  newer) and a driver recent enough for the built-in kernels (PTX version 9.3, from CUDA
+  13.3). With an older driver, the library recompiles the kernels itself if the CUDA toolkit
+  is installed (its compiler, NVRTC), and otherwise falls back to the CPU.
+- **Only tested on one GPU:** a GeForce RTX 4070 Ti under Windows 11 (driver 610.88). Linux with an
+  NVIDIA card runs the same code but has not been tried. The no-GPU case was tested on Windows (a
+  simulated machine without CUDA) and on the NUC (Debian, no NVIDIA card).
+- **Not on the GPU:** gzip-compressed images, lossless floating-point tiles, 64-bit integers
+  (they need exact integer arithmetic), and everything about WCS and cutouts. With
+  `device="gpu"` these raise an error that says so; with `auto` they use the CPU.
+- **One GPU, one call at a time:** device 0 is used (`CUDA_VISIBLE_DEVICES` chooses which card
+  that is), and GPU calls from several threads wait for each other.
+- **Memory:** the library keeps 128 MiB of page-locked RAM for the transfers once the GPU has
+  been used (two staging buffers of 64 MiB: I measured 16 MiB, 64 MiB and 256 MiB, and 64 is
+  the fastest, because the limit is memory bandwidth, not quantity), plus the image itself in
+  the card's memory for `GpuImage`.
+- **First GPU call of a process:** starting CUDA costs about 0.1 to 0.2 s. For a script that
+  makes a single call on a small file, that is more than the CPU takes: `auto` accounts for it
+  with the 64 MB / 256 tiles thresholds above.
+
+To reproduce the table: run
+`python scripts/benchmark_vs_astropy_real.py FILE --gpu --label "i9 (PC)" --workload "raw tile" --json out.json`
+on each machine, then
+`python scripts/make_comparison_table.py *.json > benchmarks/COMPARISON.md`.
+After editing the GPU programs (`euclidrust/src/kernels.cu`), regenerate the built-in
+PTX with `python scripts/build_ptx.py` (this one needs the CUDA toolkit) and rebuild.
 
 ## Run the tests (optional)
 
@@ -691,14 +781,13 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
   frame, one raw NISP detector and one segmentation map. That is enough to
   show the approach works on real archival products, not a representative
   sample across instruments, bands and tiles.
-- **Tested on one machine only.** An Intel NUC running Debian 13 (Linux
-  6.12, x86_64): Intel Core i7-8559U (4 cores / 8 threads, 2.7 GHz, up to
-  4.5 GHz), 31 GiB of RAM, an NVMe SSD, Python 3.13.5 and Rust 1.100. macOS,
-  Windows and ARM have not been tried, nor other Python versions (the
-  package declares 3.8 or newer, which is what PyO3 supports, but only 3.13
-  was run), nor machines with a very different core count or much less
-  memory (the images are memory-mapped, so a laptop with 8 GB of RAM should
-  cope with the 1.47 GB tile, but I have not measured it).
+- **Tested on two machines.** (1) An Intel NUC running Debian 13 (Linux 6.12, x86_64): Intel Core
+  i7-8559U (4 cores / 8 threads, 2.7 GHz, up to 4.5 GHz), 31 GiB of RAM, an NVMe SSD, Python
+  3.13.5, Rust 1.100, no NVIDIA GPU. (2) A desktop PC running Windows 11: Intel Core i9-10850K
+  (10 cores / 20 threads), 64 GiB of RAM, an NVIDIA GeForce RTX 4070 Ti (12 GB), Python 3.12.10,
+  Rust 1.95. macOS and ARM have not been tried, nor Linux with an NVIDIA GPU, nor machines with
+  much less memory (the images are memory-mapped, so a laptop with 8 GB of RAM should cope with the
+  1.47 GB tile, but I have not measured it).
 - **No continuous integration, no pre-built packages.** The tests are run by hand (there is no CI workflow). The package is not on PyPI: you build
   it yourself, which needs a Rust toolchain. The interface is version 0.1.0
   and may change.
@@ -709,6 +798,11 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
   If another process truncates or overwrites a file during a call, the
   operating system can kill the Python process (this is how `mmap` works; I
   have not tried to provoke it). Network or FUSE file systems are untested.
+- **On Windows, mapping a whole big file is expensive to undo.** Closing a view of the 1.47 GB tile took
+  165 ms, more than the computation. The library therefore reads big images through many small
+  mapped windows, one per thread, which spreads that cost (255 ms became 123 ms). Linux does
+  not have this problem. Astropy's `memmap` is also much slower on Windows (1.3 s against 0.48 s
+  on the NUC for the same statistics).
 - **All the cores are used by default.** The number of threads follows the
   machine; to limit it (a shared node, for example) set the environment
   variable `RAYON_NUM_THREADS` before starting Python, e.g.
