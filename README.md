@@ -25,6 +25,7 @@ euclid_fast.export_cutout_parquet("tile.fits", 83.82, -5.39, 50, 50, "cutout.par
 [How Python and Rust fit together](#how-python-and-rust-fit-together-pyo3) ·
 [Install](#install) ·
 [Use it](#use-it) ·
+[Many images at once](#many-images-at-once) ·
 [Tests](#run-the-tests-optional) ·
 [Run the benchmark](#run-the-benchmark-on-your-own-fits-file) ·
 [Troubleshooting](#troubleshooting) ·
@@ -294,6 +295,9 @@ Reference:
 | `fits_stats(path, hdu=None)` | `FitsStats` | `min`, `max`, `mean`, `naxis1`, `naxis2`, `bitpix`, `threads_used`, `elapsed_ms` |
 | `extract_cutout(path, ra_deg, dec_deg, width, height, hdu=None)` | `Cutout` | `data` (flat list of floats, row-major), `width`, `height`, `pixel_x_center`, `pixel_y_center`, `elapsed_ms` |
 | `export_cutout_parquet(path, ra_deg, dec_deg, width, height, out_path, hdu=None)` | `ParquetExport` | `out_path`, `rows`, `elapsed_ms` |
+| `fits_stats_many(paths, hdu=None, skip_errors=False)` | list of `FitsStats` (or `None`) | one per file, in the same order; see [Many images at once](#many-images-at-once) |
+| `fits_stats_all_hdus(path, name_contains=None)` | list of `HduStats` | per image HDU: `index`, `name`, `naxis1`, `naxis2`, `bitpix`, `min`, `max`, `mean`, `elapsed_ms` |
+| `extract_cutouts(path, ra_deg, dec_deg, width, height, hdu=None, skip_errors=False)` | list of `Cutout` (or `None`) | one per position, same fields as `extract_cutout` |
 | `list_hdus(path)` | list of `HduInfo` | per HDU: `index`, `kind` (`PRIMARY`, `IMAGE`, `BINTABLE`...), `name`, `bitpix`, `shape` (NAXIS1, NAXIS2...), `readable`, `note` (why it is not readable) |
 | `detected_cpus()` | `int` | number of logical cores found on this machine |
 
@@ -305,6 +309,64 @@ coordinates in the source image) and `value`. All errors (file not found,
 wrong kind of HDU, cutout outside the image, unsupported WCS...) are raised
 as `ValueError`.
 
+## Many images at once
+
+When you have many images, three functions do the looping in Rust, in
+parallel on all the cores, with the GIL released:
+
+```python
+# 1. The same statistics over many files (one result per file, same order)
+results = euclid_fast.fits_stats_many(paths)
+results = euclid_fast.fits_stats_many(paths, hdu=1)               # hdu applies to every file
+results = euclid_fast.fits_stats_many(paths, skip_errors=True)    # None for a file that cannot be read
+
+# 2. Every image HDU of one frame (all the detectors of a Euclid frame)
+for r in euclid_fast.fits_stats_all_hdus("frame.fits", name_contains="SCI"):
+    print(r.index, r.name, r.min, r.max, r.mean)
+
+# 3. Many cutouts from one file, e.g. a catalogue of objects
+#    (ras, decs: two equal-length lists or numpy arrays, in degrees)
+cutouts = euclid_fast.extract_cutouts("tile.fits", ras, decs, 50, 50)
+images = [np.array(c.data).reshape(50, 50) for c in cutouts]
+```
+
+Details:
+
+- Results come back in the order of the inputs. `fits_stats_all_hdus`
+  returns the HDUs in file order, skipping the ones that are not readable
+  images (the empty primary HDU, tables...); `name_contains` keeps only the
+  HDUs whose `EXTNAME` contains that text, case-insensitively (for example
+  `"SCI"` to leave out the `RMS` and `DQ` images).
+- By default the first problem raises a `ValueError` that names the file (or
+  the position, for cutouts). With `skip_errors=True`, the failed items are
+  `None` instead, so you can process a whole list and look at the failures
+  afterwards.
+- `extract_cutouts` opens the file and reads its header once, then
+  extracts the positions in parallel.
+- **The GIL is released** during all the calls (single or batch), so other
+  Python threads keep running while Rust works. For example, a counter in the
+  main thread reached 731,463 while one 155 ms `fits_stats` call on the 1.47
+  GB mosaic ran in another thread.
+
+What this buys you, measured on real Euclid data (median of 3 runs, warm
+cache; the 40-file case uses 40 copies of one detector, so everything is in
+the OS cache):
+
+| Task | `astropy` | `euclid_fast`: a loop of single calls | `euclid_fast`: one batch call |
+|---|---|---|---|
+| Stats of the 48 image HDUs of a NISP frame (799 MB) | 484 ms | 102 ms | 72 ms |
+| Stats of the 144 image HDUs of a VIS frame (2.4 GB) | 1309 ms | 693 ms | 299 ms |
+| Stats of 40 files (17 MB each, uncompressed) | 274 ms | 68 ms | 55 ms |
+| Stats of 40 Rice-compressed files | 3317 ms | 583 ms | 572 ms |
+| 1000 cutouts 50×50 from the 1.47 GB mosaic | 108 ms (WCS built once) / 2835 ms (WCS and file reopened each time) | 216 ms | 39 ms |
+
+Every result is identical to astropy's and to the single calls'. How to read
+the table: the batch call helps most where each item is small (many cutouts,
+frames with many small HDUs). On big or compressed files a single call
+already uses all the cores, so a batch call is barely faster than a loop;
+the large gain over astropy there comes from reading and decoding in
+parallel, not from batching.
+
 ## Run the tests (optional)
 
 `tests/test_input_validation.py` builds small FITS files with astropy and
@@ -312,7 +374,8 @@ checks that supported files work (primary HDU, extensions, `BITPIX` 16 and
 64, `BZERO`/`BSCALE`), that unsupported ones are rejected with a clear error,
 that the TPV distortion agrees with astropy/wcslib on a strongly distorted
 synthetic header, and that tile-compressed images (`RICE_1`, `GZIP_1`,
-`GZIP_2`, quantization and dithering) decode exactly like astropy/cfitsio. It needs no download. With `euclid_fast`
+`GZIP_2`, quantization and dithering) decode exactly like astropy/cfitsio, and
+that the batch functions return what the single calls return. It needs no download. With `euclid_fast`
 installed and `pip install -r scripts/requirements.txt` done:
 
 ```bash
@@ -428,13 +491,13 @@ consortium's HPC clusters:
 
 `euclid_fast` addresses both with a small Rust core: `mmap`-based
 zero-copy access to uncompressed FITS data, and a `rayon` thread pool that
-auto-sizes itself to the host's logical core count — there is no hardcoded
+auto-sizes itself to the host's logical core count (the GIL is released while it works) — there is no hardcoded
 thread count, so the same binary scales itself from a laptop to a
 many-core workstation.
 
 ## What it does today
 
-Three operations (plus `list_hdus` to see what a file contains), each independently benchmarked against `astropy` on
+Three single-image operations (plus `list_hdus` to see what a file contains, and batch versions of them, see [Many images at once](#many-images-at-once)), each independently benchmarked against `astropy` on
 identical input and compared for numerical correctness, not just speed:
 
 | Function | What it computes | Notes |
@@ -559,9 +622,11 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
   compressed files tested were produced by astropy/cfitsio, not by Euclid's
   pipeline. Compressed cutouts decode whole tiles, so images compressed
   with very large tiles make cutouts slower.
-- **One image per call.** Each call reads a single HDU of a single file; no
-  batch processing across a file list or all the detectors of a frame at once
-  (yet — see Roadmap).
+- **Batch results are held in memory.** `fits_stats_many` and
+  `extract_cutouts` return everything as Python lists at the end: there is
+  no streaming and no progress callback, so a huge list of cutouts uses
+  memory proportional to its size. `hdu=` is the same for every file of a
+  `fits_stats_many` call.
 - **WCS: TAN and TPV only.** Cutouts do not handle SIP distortion
   (`TAN-SIP`) or other projections, and they require the `CD` matrix form.
   The TPV inverse (sky to pixel) is solved iteratively and agrees with
@@ -583,7 +648,7 @@ This is the first of four planned components for Euclid-scale data
 processing, chosen first specifically because it needed no GPU/cluster
 and is the foundation the others build on:
 
-1. ✅ **FITS streaming / cutout / Parquet export** (this package). Next steps for this component, in the order I would do them: batch access to many files or all detectors of a frame, SIP distortion, then the remaining compression algorithms (`HCOMPRESS_1`, `PLIO_1`) if someone needs them.
+1. ✅ **FITS streaming / cutout / Parquet export** (this package). Next steps for this component, in the order I would do them: SIP distortion, then the remaining compression algorithms (`HCOMPRESS_1`, `PLIO_1`) if someone needs them.
 2. Catalogue cross-matching at the hundred-million-to-billion-object
    scale (HEALPix / spherical KD-tree indexing, memory-mapped for
    datasets larger than available RAM).

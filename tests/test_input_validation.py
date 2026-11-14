@@ -250,9 +250,88 @@ def test_compressed_images(tmp):
                               quantize_level=0.0); n += 1
 
 
+def _same_stats(a, b):
+    return (a.min, a.max, a.mean, a.naxis1, a.naxis2, a.bitpix) == (b.min, b.max, b.mean, b.naxis1, b.naxis2, b.bitpix)
+
+
+def test_batch(tmp):
+    # --- fits_stats_many: several files at once, same results as one at a time ---
+    paths = []
+    for k in range(6):
+        h = fits.PrimaryHDU((IMG + 10 * k).astype(np.float32)); add_wcs(h.header)
+        paths.append(write(tmp, f"many{k}.fits", fits.HDUList([h])))
+    many = euclid_fast.fits_stats_many(paths)
+    assert len(many) == 6 and all(_same_stats(m, euclid_fast.fits_stats(p)) for m, p in zip(many, paths))
+    assert euclid_fast.fits_stats_many([]) == []
+
+    missing = str(Path(tmp) / "nope.fits")
+    raises(lambda: euclid_fast.fits_stats_many(paths + [missing]), "nope.fits", "cannot open")
+    mixed = euclid_fast.fits_stats_many(paths[:2] + [missing] + paths[2:], skip_errors=True)
+    assert mixed[2] is None and [m is None for m in mixed].count(True) == 1
+
+    # `hdu` applies to every file (here: files whose images are in an extension)
+    ext_paths = []
+    for k in range(3):
+        sci = fits.ImageHDU((IMG * (k + 1)).astype(np.float32), name="DET11.SCI"); add_wcs(sci.header)
+        ext_paths.append(write(tmp, f"ext{k}.fits", fits.HDUList([fits.PrimaryHDU(), sci])))
+    res = euclid_fast.fits_stats_many(ext_paths, hdu="DET11.SCI")
+    assert [round(r.mean, 2) for r in res] == [round(float(IMG.mean()) * (k + 1), 2) for k in range(3)]
+    raises(lambda: euclid_fast.fits_stats_many(ext_paths), "ext0.fits", "NAXIS = 0")
+
+    # --- fits_stats_all_hdus: every image HDU of a frame, in file order ---
+    hdus = [fits.PrimaryHDU()]
+    for det in ("DET11", "DET12", "DET21"):
+        sci = fits.ImageHDU((IMG + len(hdus)).astype(np.float32), name=f"{det}.SCI"); add_wcs(sci.header)
+        hdus += [sci, fits.ImageHDU((IMG * 2).astype(np.float32), name=f"{det}.RMS"),
+                 fits.ImageHDU((IMG > 100).astype(np.uint8), name=f"{det}.DQ")]
+    hdus.append(fits.BinTableHDU.from_columns([fits.Column(name="a", format="E", array=np.arange(3, dtype=np.float32))]))
+    frame = write(tmp, "frame9.fits", fits.HDUList(hdus))
+    allres = euclid_fast.fits_stats_all_hdus(frame)
+    assert [r.index for r in allres] == list(range(1, 10))            # primary and table are skipped
+    assert [r.name for r in allres[:3]] == ["DET11.SCI", "DET11.RMS", "DET11.DQ"]
+    for r in allres:
+        s = euclid_fast.fits_stats(frame, hdu=r.index)
+        assert (r.min, r.max, r.mean, r.naxis1, r.naxis2, r.bitpix) == (s.min, s.max, s.mean, s.naxis1, s.naxis2, s.bitpix)
+    assert [r.name for r in euclid_fast.fits_stats_all_hdus(frame, name_contains="sci")] == \
+        ["DET11.SCI", "DET12.SCI", "DET21.SCI"]
+    assert euclid_fast.fits_stats_all_hdus(frame, name_contains="nothing-matches") == []
+
+    # --- extract_cutouts: many positions from one file ---
+    wcs = WCS(fits.getheader(paths[0]))
+    pix = [(60.3, 50.7), (200.0, 120.0), (150.5, 99.5), (5.0, 5.0), (300.0, 190.0), (-50.0, 40.0), (100.0, 60.0)]
+    ras, decs = (list(v) for v in wcs.all_pix2world([p[0] for p in pix], [p[1] for p in pix], 1))
+    batch = euclid_fast.extract_cutouts(paths[0], ras, decs, 17, 13, skip_errors=True)
+    assert len(batch) == len(pix)
+    for (ra, dec), b in zip(zip(ras, decs), batch):
+        try:
+            single = euclid_fast.extract_cutout(paths[0], ra, dec, 17, 13)
+        except ValueError:
+            assert b is None                                     # outside the image
+            continue
+        assert b.data == single.data and (b.pixel_x_center, b.pixel_y_center) == (single.pixel_x_center, single.pixel_y_center)
+        assert (b.width, b.height) == (17, 13)
+    assert any(b is None for b in batch) and sum(b is not None for b in batch) >= 4
+    raises(lambda: euclid_fast.extract_cutouts(paths[0], ras, decs, 17, 13), "position", "outside the image")
+    raises(lambda: euclid_fast.extract_cutouts(paths[0], ras, decs[:-1], 17, 13), "same length")
+    assert euclid_fast.extract_cutouts(paths[0], [], [], 17, 13) == []
+    # numpy arrays are accepted, and so are compressed images and extensions
+    got = euclid_fast.extract_cutouts(paths[0], np.array(ras[:3]), np.array(decs[:3]), 5, 5)
+    assert len(got) == 3
+    comp = fits.CompImageHDU(IMG, header=fits.getheader(paths[0]), compression_type="RICE_1")
+    cp = write(tmp, "batch_comp.fits", fits.HDUList([fits.PrimaryHDU(), comp]))
+    cb = euclid_fast.extract_cutouts(cp, ras, decs, 17, 13, hdu=1, skip_errors=True)
+    for (ra, dec), b in zip(zip(ras, decs), cb):
+        try:
+            single = euclid_fast.extract_cutout(cp, ra, dec, 17, 13, hdu=1)
+        except ValueError:
+            assert b is None
+            continue
+        assert b.data == single.data
+
+
 def test_all():
     for fn in (test_supported_primary, test_int64, test_extensions, test_unreadable_hdus,
-               test_rejected_inputs, test_tpv_matches_astropy, test_compressed_images):
+               test_rejected_inputs, test_tpv_matches_astropy, test_compressed_images, test_batch):
         with tempfile.TemporaryDirectory() as tmp:
             fn(tmp)
             print("ok  ", fn.__name__)

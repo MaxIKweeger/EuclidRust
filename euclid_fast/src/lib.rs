@@ -1158,20 +1158,13 @@ fn reduce_f64(v: &[f64]) -> (f64, f64, f64) {
     (mn, mx, sum)
 }
 
-/// Reads a FITS image (2-D, raw or tile-compressed) and computes min/max/mean
-/// in parallel with rayon. Raw images are read through mmap (zero-copy for the
-/// disk -> memory part); compressed images are decoded tile by tile, the tiles
-/// being spread over the threads. The rayon thread pool sizes itself to the
-/// number of cores available on the machine (no hardcoded value). `hdu`
-/// selects the HDU by 0-based index or EXTNAME; by default the primary HDU is
-/// read.
-#[pyfunction]
-#[pyo3(signature = (path, hdu=None))]
-fn fits_stats(path: &str, hdu: Option<HduSelector>) -> PyResult<FitsStats> {
+/// Computes min/max/mean of one image HDU. Pure Rust (no Python objects), so it
+/// can run with the GIL released and from several threads at once.
+fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
     let start = std::time::Instant::now();
 
     let mmap = open_mmap(path)?;
-    let header = locate_image(&mmap, &hdu)?;
+    let header = locate_image(&mmap, hdu)?;
     let n_pixels = header.naxis1 * header.naxis2;
 
     let (min, max, sum) = if let Some(t) = &header.tiled {
@@ -1214,6 +1207,127 @@ fn fits_stats(path: &str, hdu: Option<HduSelector>) -> PyResult<FitsStats> {
         mean,
         threads_used: rayon::current_num_threads(),
         elapsed_ms,
+    })
+}
+
+
+/// Reads a FITS image (2-D, raw or tile-compressed) and computes min/max/mean
+/// in parallel with rayon. Raw images are read through mmap (zero-copy for the
+/// disk -> memory part); compressed images are decoded tile by tile, the tiles
+/// being spread over the threads. The rayon thread pool sizes itself to the
+/// number of cores available on the machine (no hardcoded value). The GIL is
+/// released while Rust works, so other Python threads keep running. `hdu`
+/// selects the HDU by 0-based index or EXTNAME; by default the primary HDU is
+/// read.
+#[pyfunction]
+#[pyo3(signature = (path, hdu=None))]
+fn fits_stats(python: Python<'_>, path: &str, hdu: Option<HduSelector>) -> PyResult<FitsStats> {
+    python.detach(|| stats_impl(path, &hdu))
+}
+
+/// Statistics of one HDU, as returned by `fits_stats_all_hdus`.
+#[pyclass]
+struct HduStats {
+    #[pyo3(get)]
+    index: usize,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    naxis1: usize,
+    #[pyo3(get)]
+    naxis2: usize,
+    #[pyo3(get)]
+    bitpix: i32,
+    #[pyo3(get)]
+    min: f64,
+    #[pyo3(get)]
+    max: f64,
+    #[pyo3(get)]
+    mean: f64,
+    #[pyo3(get)]
+    elapsed_ms: f64,
+}
+
+/// Prefixes an error with the file (or position) it comes from.
+fn tag_error(python: Python<'_>, what: &str, e: PyErr) -> PyErr {
+    PyValueError::new_err(format!("{what}: {}", e.value(python)))
+}
+
+/// Statistics of many files at once. The files are processed in parallel on
+/// all the cores, with the GIL released. `hdu` applies to every file. With
+/// `skip_errors=True`, a file that cannot be read gives `None` in the result
+/// instead of raising an error.
+#[pyfunction]
+#[pyo3(signature = (paths, hdu=None, skip_errors=false))]
+fn fits_stats_many(
+    python: Python<'_>,
+    paths: Vec<String>,
+    hdu: Option<HduSelector>,
+    skip_errors: bool,
+) -> PyResult<Vec<Option<FitsStats>>> {
+    let results: Vec<PyResult<FitsStats>> =
+        python.detach(|| paths.par_iter().map(|p| stats_impl(p, &hdu)).collect());
+    let mut out = Vec::with_capacity(results.len());
+    for (path, r) in paths.iter().zip(results) {
+        match r {
+            Ok(s) => out.push(Some(s)),
+            Err(e) if skip_errors => {
+                let _ = e;
+                out.push(None)
+            }
+            Err(e) => return Err(tag_error(python, path, e)),
+        }
+    }
+    Ok(out)
+}
+
+/// Whether an HDU is an image that `euclid_fast` can read.
+fn is_readable(h: &RawHeader, data_offset: usize) -> bool {
+    if is_compressed_image(h) {
+        return build_tiled(h, data_offset).is_ok();
+    }
+    is_image_hdu(h)
+        && h.naxis == Some(2)
+        && matches!(h.bitpix, Some(8) | Some(16) | Some(32) | Some(64) | Some(-32) | Some(-64))
+}
+
+/// Statistics of every readable image HDU of one file (all the detectors of a
+/// Euclid frame, for example), computed in parallel with the GIL released.
+/// `name_contains` keeps only the HDUs whose EXTNAME contains that text
+/// (case-insensitive), e.g. "SCI" to skip the RMS and DQ images.
+#[pyfunction]
+#[pyo3(signature = (path, name_contains=None))]
+fn fits_stats_all_hdus(
+    python: Python<'_>,
+    path: &str,
+    name_contains: Option<String>,
+) -> PyResult<Vec<HduStats>> {
+    python.detach(|| {
+        let mmap = open_mmap(path)?;
+        let needle = name_contains.map(|s| s.to_ascii_lowercase());
+        let wanted: Vec<(usize, String)> = all_hdus(&mmap)?
+            .iter()
+            .filter(|x| is_readable(&x.header, x.data_offset))
+            .map(|x| (x.index, x.header.extname.clone().unwrap_or_default()))
+            .filter(|(_, name)| needle.as_ref().is_none_or(|n| name.to_ascii_lowercase().contains(n)))
+            .collect();
+        wanted
+            .par_iter()
+            .map(|(index, name)| {
+                let sel = Some(HduSelector::Index(*index));
+                stats_impl(path, &sel).map(|s| HduStats {
+                    index: *index,
+                    name: name.clone(),
+                    naxis1: s.naxis1,
+                    naxis2: s.naxis2,
+                    bitpix: s.bitpix,
+                    min: s.min,
+                    max: s.max,
+                    mean: s.mean,
+                    elapsed_ms: s.elapsed_ms,
+                })
+            })
+            .collect()
     })
 }
 
@@ -1454,6 +1568,18 @@ fn extract_cutout_raw(
 ) -> PyResult<(f64, f64, usize, usize, Vec<f64>)> {
     let mmap = open_mmap(path)?;
     let header = locate_image(&mmap, hdu)?;
+    cutout_at(&mmap, &header, ra_deg, dec_deg, width, height)
+}
+
+/// One cutout from an already opened file and located HDU.
+fn cutout_at(
+    mmap: &[u8],
+    header: &FitsHeader,
+    ra_deg: f64,
+    dec_deg: f64,
+    width: usize,
+    height: usize,
+) -> PyResult<(f64, f64, usize, usize, Vec<f64>)> {
     let wcs = header
         .wcs
         .ok_or_else(|| PyValueError::new_err("this file has no WCS header (CRVAL/CRPIX/CD)"))?;
@@ -1499,7 +1625,7 @@ fn extract_cutout_raw(
             (ty_lo..=ty_hi).flat_map(|ty| (tx_lo..=tx_hi).map(move |tx| (tx, ty))).collect();
         let decoded: Vec<Vec<f64>> = wanted
             .par_iter()
-            .map(|&(tx, ty)| decode_tile(t, &mmap, ty * ntx + tx))
+            .map(|&(tx, ty)| decode_tile(t, mmap, ty * ntx + tx))
             .collect::<PyResult<Vec<_>>>()?;
 
         let mut data = vec![0.0f64; width * height];
@@ -1564,6 +1690,7 @@ fn extract_cutout_raw(
 #[pyfunction]
 #[pyo3(signature = (path, ra_deg, dec_deg, width, height, hdu=None))]
 fn extract_cutout(
+    python: Python<'_>,
     path: &str,
     ra_deg: f64,
     dec_deg: f64,
@@ -1572,7 +1699,8 @@ fn extract_cutout(
     hdu: Option<HduSelector>,
 ) -> PyResult<Cutout> {
     let start = std::time::Instant::now();
-    let (px, py, _x0, _y0, data) = extract_cutout_raw(path, ra_deg, dec_deg, width, height, &hdu)?;
+    let (px, py, _x0, _y0, data) =
+        python.detach(|| extract_cutout_raw(path, ra_deg, dec_deg, width, height, &hdu))?;
     Ok(Cutout {
         width,
         height,
@@ -1581,6 +1709,65 @@ fn extract_cutout(
         data,
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+/// Many cutouts from one file: the file is opened and its header read once,
+/// then the positions are processed in parallel on all the cores, with the GIL
+/// released. `ra_deg` and `dec_deg` are two equal-length lists (or numpy
+/// arrays). With `skip_errors=True`, a position that cannot be extracted (for
+/// example outside the image) gives `None` instead of raising an error.
+#[pyfunction]
+#[pyo3(signature = (path, ra_deg, dec_deg, width, height, hdu=None, skip_errors=false))]
+fn extract_cutouts(
+    python: Python<'_>,
+    path: &str,
+    ra_deg: Vec<f64>,
+    dec_deg: Vec<f64>,
+    width: usize,
+    height: usize,
+    hdu: Option<HduSelector>,
+    skip_errors: bool,
+) -> PyResult<Vec<Option<Cutout>>> {
+    if ra_deg.len() != dec_deg.len() {
+        return err(format!(
+            "ra_deg and dec_deg must have the same length ({} and {})",
+            ra_deg.len(),
+            dec_deg.len()
+        ));
+    }
+    let results: Vec<PyResult<Cutout>> = python.detach(|| -> PyResult<Vec<PyResult<Cutout>>> {
+        let mmap = open_mmap(path)?;
+        let header = locate_image(&mmap, &hdu)?;
+        Ok(ra_deg
+            .par_iter()
+            .zip(dec_deg.par_iter())
+            .map(|(&ra, &dec)| {
+                let start = std::time::Instant::now();
+                cutout_at(&mmap, &header, ra, dec, width, height).map(|(px, py, _x0, _y0, data)| Cutout {
+                    width,
+                    height,
+                    pixel_x_center: px,
+                    pixel_y_center: py,
+                    data,
+                    elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+                })
+            })
+            .collect())
+    })?;
+    let mut out = Vec::with_capacity(results.len());
+    for (i, r) in results.into_iter().enumerate() {
+        match r {
+            Ok(c) => out.push(Some(c)),
+            Err(e) if skip_errors => {
+                let _ = e;
+                out.push(None)
+            }
+            Err(e) => {
+                return Err(tag_error(python, &format!("position {i} (ra={}, dec={})", ra_deg[i], dec_deg[i]), e))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Result of a Parquet export.
@@ -1602,6 +1789,7 @@ struct ParquetExport {
 #[pyfunction]
 #[pyo3(signature = (path, ra_deg, dec_deg, width, height, out_path, hdu=None))]
 fn export_cutout_parquet(
+    python: Python<'_>,
     path: &str,
     ra_deg: f64,
     dec_deg: f64,
@@ -1611,7 +1799,8 @@ fn export_cutout_parquet(
     hdu: Option<HduSelector>,
 ) -> PyResult<ParquetExport> {
     let start = std::time::Instant::now();
-    let (_px, _py, x0, y0, data) = extract_cutout_raw(path, ra_deg, dec_deg, width, height, &hdu)?;
+    let (_px, _py, x0, y0, data) =
+        python.detach(|| extract_cutout_raw(path, ra_deg, dec_deg, width, height, &hdu))?;
 
     let n = data.len();
     let mut xs = Vec::with_capacity(n);
@@ -1662,10 +1851,14 @@ fn euclid_fast(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_cutout, m)?)?;
     m.add_function(wrap_pyfunction!(export_cutout_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(list_hdus, m)?)?;
+    m.add_function(wrap_pyfunction!(fits_stats_many, m)?)?;
+    m.add_function(wrap_pyfunction!(fits_stats_all_hdus, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_cutouts, m)?)?;
     m.add_function(wrap_pyfunction!(detected_cpus, m)?)?;
     m.add_class::<FitsStats>()?;
     m.add_class::<Cutout>()?;
     m.add_class::<ParquetExport>()?;
     m.add_class::<HduInfo>()?;
+    m.add_class::<HduStats>()?;
     Ok(())
 }
