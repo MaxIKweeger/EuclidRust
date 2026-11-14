@@ -1,0 +1,26 @@
+[package]
+name = "euclid_fast"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "euclid_fast"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29.0", features = ["extension-module"] }
+rayon = "1"
+memmap2 = "0.9"
+num_cpus = "1"
+parquet = { version = "60", features = ["arrow"] }
+arrow-array = "60"
+
+# Perf max : LTO complet, un seul codegen-unit (meilleure optimisation croisée,
+# compile plus lentement mais le binaire final est plus rapide), panic=abort
+# pas utilisé ici car PyO3 a besoin de pouvoir remonter des exceptions Python.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3

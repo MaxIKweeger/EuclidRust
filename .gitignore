@@ -1,0 +1,15 @@
+# Environnement Python (recréé via: python3 -m venv .venv && pip install maturin)
+.venv/
+
+# Données volumineuses : ne jamais pousser des FITS/Parquet de plusieurs
+# centaines de Mo à quelques Go dans git. Les scripts de scripts/ savent
+# les régénérer (make_orion_1gb.py) ou les retélécharger (voir README).
+data/*.fits
+data/*.parquet
+data/real/
+
+__pycache__/
+*.pyc
+
+# Build Rust (déjà couvert dans euclid_fast/.gitignore, redondance ok)
+euclid_fast/target/
