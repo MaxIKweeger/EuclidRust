@@ -1,5 +1,5 @@
 [package]
-name = "euclid_fast"
+name = "euclidrust"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
@@ -7,7 +7,7 @@ license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "euclid_fast"
+name = "euclidrust"
 crate-type = ["cdylib"]
 
 [dependencies]

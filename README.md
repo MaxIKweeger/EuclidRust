@@ -1,18 +1,16 @@
-# euclid_fast
+# EuclidRust
 
 High-performance FITS I/O for Python, written in Rust and exposed via
 [PyO3](https://pyo3.rs/) as a normal, `pip install`-able Python extension
 module. Built as a testbed for data-processing tools for the ESA **Euclid**
-mission, but useful for any FITS-based workflow. The repository is called
-**EuclidRust**; the Python package inside it, and the name you `import`, is
-`euclid_fast`.
+mission, but useful for any FITS-based workflow. The Python package it contains, and the name you `import`, is `euclidrust`.
 
 ```python
-import euclid_fast
+import euclidrust
 
-stats = euclid_fast.fits_stats("tile.fits")
-cutout = euclid_fast.extract_cutout("tile.fits", ra_deg=83.82, dec_deg=-5.39, width=50, height=50)
-euclid_fast.export_cutout_parquet("tile.fits", 83.82, -5.39, 50, 50, "cutout.parquet")
+stats = euclidrust.fits_stats("tile.fits")
+cutout = euclidrust.extract_cutout("tile.fits", ra_deg=83.82, dec_deg=-5.39, width=50, height=50)
+euclidrust.export_cutout_parquet("tile.fits", 83.82, -5.39, 50, 50, "cutout.parquet")
 ```
 
 > **About this project.** The code, benchmarks and documentation here were
@@ -44,12 +42,12 @@ image sits in the primary HDU or in an extension.**
 FITS (Flexible Image Transport System) is the standard file format of
 astronomy. A FITS file is a sequence of blocks called HDUs ("header/data
 units"): each has a text header and a payload, which can be an image or a
-table. `euclid_fast` reads **images**: a rectangular grid of pixels (a sky
+table. `euclidrust` reads **images**: a rectangular grid of pixels (a sky
 mosaic, a detector frame...), plus the header keywords that say how pixels
 map to the sky (the WCS).
 
 Where the image sits depends on the product. A Euclid **MER mosaic** keeps
-its image in the first HDU (the "primary HDU"), which is what `euclid_fast`
+its image in the first HDU (the "primary HDU"), which is what `euclidrust`
 reads by default. **Calibrated frames** (VIS, NISP) and **raw frames** have
 an *empty* primary HDU and one image extension per detector, with names such
 as `DET11.SCI` or `1-1.E`. For those you pick the HDU with the `hdu=`
@@ -76,7 +74,7 @@ why, rather than being read wrongly (these cases are covered by
 | 3-D cubes (`NAXIS = 3`) | `NAXIS = 3 is not supported ...: only 2-D images are handled` |
 | Not a FITS file | `truncated file: no END card found` |
 | A projection that is not implemented (cylindrical or all-sky ones such as `CAR`, `AIT`, `MOL`, `HPX`...), a mismatched `CTYPE` pair, or a missing `CTYPE` | Cutouts raise `unsupported WCS projection: found CTYPE1/CTYPE2 = ...; supported are RA---TAN/DEC--TAN (also with -SIP distortion), RA---TPV/DEC--TPV and the zenithal projections SIN, ARC, STG, ZEA and ZPN ...` (`fits_stats` still works) |
-| Distortion stored in lookup tables (HST `CPDIS` / `D2IMDIS` keywords) | Cutouts raise `this header declares distortion corrections stored in lookup tables ... which euclid_fast does not apply` (`fits_stats` still works) |
+| Distortion stored in lookup tables (HST `CPDIS` / `D2IMDIS` keywords) | Cutouts raise `this header declares distortion corrections stored in lookup tables ... which euclidrust does not apply` (`fits_stats` still works) |
 | No WCS at all (no `CRVAL` / `CRPIX` / matrix keywords) | Cutouts raise `this file has no WCS header (CRVAL, CRPIX and either a CD matrix or CDELT/PC)` (`fits_stats` still works) |
 
 **Null pixels.** NaN pixels of floating-point images are left out of `min`, `max` and `mean` and counted in `n_nan` (infinities are values and stay in). The `BLANK` null value of integer images is **not** honoured: those pixels are counted as ordinary values.
@@ -105,8 +103,8 @@ None of the Q1 image files I looked at were tile-compressed, so there was no com
 To check a file yourself before running anything on it, list its HDUs:
 
 ```python
-import euclid_fast
-for hdu in euclid_fast.list_hdus("file.fits"):
+import euclidrust
+for hdu in euclidrust.list_hdus("file.fits"):
     print(hdu)
 # <HduInfo index=0 kind=PRIMARY shape=- bitpix=8 readable=no (no image data)>
 # <HduInfo index=1 name="DET11.SCI" kind=IMAGE shape=2040x2040 bitpix=-32 readable=yes>
@@ -137,9 +135,9 @@ Under the hood there are three pieces:
 
 | Piece | Where | What it does |
 |---|---|---|
-| The Rust code | `euclid_fast/src/lib.rs` | Does the actual work: memory-maps the FITS file, runs the parallel computation, converts sky coordinates to pixels |
-| **PyO3** | a dependency in `euclid_fast/Cargo.toml` | A Rust library that turns Rust functions and structs into Python functions and objects, and converts arguments between the two (for example, `hdu=` accepts a Python `int` or `str`, which PyO3 maps to a Rust `enum`) |
-| **maturin** | `build-backend` in `euclid_fast/pyproject.toml` | Compiles the Rust into a shared library and installs it in your Python environment (`pip` calls it for you) |
+| The Rust code | `euclidrust/src/lib.rs` | Does the actual work: memory-maps the FITS file, runs the parallel computation, converts sky coordinates to pixels |
+| **PyO3** | a dependency in `euclidrust/Cargo.toml` | A Rust library that turns Rust functions and structs into Python functions and objects, and converts arguments between the two (for example, `hdu=` accepts a Python `int` or `str`, which PyO3 maps to a Rust `enum`) |
+| **maturin** | `build-backend` in `euclidrust/pyproject.toml` | Compiles the Rust into a shared library and installs it in your Python environment (`pip` calls it for you) |
 
 PyO3 shows up in `lib.rs` as a handful of annotations. Here is the whole
 mapping, taken from the real code:
@@ -159,8 +157,8 @@ struct FitsStats {
     /* ... */
 }
 
-#[pymodule]                                     // -> `import euclid_fast`
-fn euclid_fast(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pymodule]                                     // -> `import euclidrust`
+fn euclidrust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fits_stats, m)?)?;
     /* ... */
     Ok(())
@@ -170,16 +168,16 @@ fn euclid_fast(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 and on the Python side it is just:
 
 ```python
-import euclid_fast                       # loads the compiled Rust library
-s = euclid_fast.fits_stats("tile.fits")  # calls the Rust function
+import euclidrust                       # loads the compiled Rust library
+s = euclidrust.fits_stats("tile.fits")  # calls the Rust function
 print(s.min, s.max, s.mean)              # reads the fields of the Rust struct
 ```
 
 So the build chain is: **Rust source -> (maturin, run by pip) -> compiled
-library such as `euclid_fast.cpython-313-x86_64-linux-gnu.so` (`.pyd` on
-Windows) -> installed into your virtual environment -> `import euclid_fast`.**
+library such as `euclidrust.cpython-313-x86_64-linux-gnu.so` (`.pyd` on
+Windows) -> installed into your virtual environment -> `import euclidrust`.**
 The scripts in `scripts/` contain no Rust and no PyO3 code; they only
-`import euclid_fast`. Errors raised in Rust arrive in Python as ordinary
+`import euclidrust`. Errors raised in Rust arrive in Python as ordinary
 `ValueError` exceptions.
 
 ## Install
@@ -215,7 +213,7 @@ cd EuclidRust
 python3 -m venv .venv                 # a private Python environment
 source .venv/bin/activate             # Windows PowerShell: .venv\Scripts\Activate.ps1
 
-pip install ./euclid_fast             # compiles the Rust code (a few minutes)
+pip install ./euclidrust             # compiles the Rust code (a few minutes)
 ```
 
 The first compile takes a few minutes because the release profile enables
@@ -223,13 +221,13 @@ full link-time optimisation; later rebuilds are faster. When it finishes,
 check that it worked:
 
 ```bash
-python -c "import euclid_fast; print('OK, threads available:', euclid_fast.detected_cpus())"
+python -c "import euclidrust; print('OK, threads available:', euclidrust.detected_cpus())"
 ```
 
 If that prints `OK, threads available: <a number>`, you are done.
 
 *Developing the Rust code?* Use `pip install maturin`, then run
-`maturin develop --release` inside `euclid_fast/`. That installs the module
+`maturin develop --release` inside `euclidrust/`. That installs the module
 in editable mode and rebuilds it after you change `src/lib.rs`.
 
 ## Use it
@@ -242,28 +240,28 @@ to get one.
 
 ```python
 import numpy as np
-import euclid_fast
+import euclidrust
 
 path = "tile.fits"
 
 # 0. What is in the file? (reads the headers only, instant)
-for hdu in euclid_fast.list_hdus(path):
+for hdu in euclidrust.list_hdus(path):
     print(hdu)
 
 # 1. Global statistics over the whole image
-s = euclid_fast.fits_stats(path)
+s = euclidrust.fits_stats(path)
 print(s.min, s.max, s.mean)          # physical values (BZERO/BSCALE applied)
 print(s.naxis1, s.naxis2, s.bitpix)  # image shape and data type
 print(s.threads_used, s.elapsed_ms)  # how it ran
 
 # 2. A cutout around a sky position (RA/Dec in degrees)
-c = euclid_fast.extract_cutout(path, ra_deg=273.0716597, dec_deg=68.0,
+c = euclidrust.extract_cutout(path, ra_deg=273.0716597, dec_deg=68.0,
                                width=50, height=50)
 image = np.array(c.data).reshape(c.height, c.width)   # row-major -> 2-D array
 print(c.pixel_x_center, c.pixel_y_center)             # FITS 1-indexed pixel position
 
 # 3. The same cutout written to a Parquet file
-r = euclid_fast.export_cutout_parquet(path, 273.0716597, 68.0, 50, 50, "cutout.parquet")
+r = euclidrust.export_cutout_parquet(path, 273.0716597, 68.0, 50, 50, "cutout.parquet")
 print(r.rows, r.out_path)
 
 import pandas as pd                  # pip install pandas pyarrow
@@ -276,9 +274,9 @@ need the `hdu` argument, a name or a 0-based index, on all three functions:
 ```python
 frame = "EUC_NIR_W-CAL-IMAGE-BKG_H-2681-0_20240930T175032.222263Z.fits"
 
-s = euclid_fast.fits_stats(frame, hdu="DET11.SCI")              # by EXTNAME
-s = euclid_fast.fits_stats(frame, hdu=1)                        # by index (same HDU)
-c = euclid_fast.extract_cutout(frame, 266.09, 67.32, 50, 50, hdu="DET11.SCI")
+s = euclidrust.fits_stats(frame, hdu="DET11.SCI")              # by EXTNAME
+s = euclidrust.fits_stats(frame, hdu=1)                        # by index (same HDU)
+c = euclidrust.extract_cutout(frame, 266.09, 67.32, 50, 50, hdu="DET11.SCI")
 ```
 
 (names are matched case-insensitively; if several HDUs share a name, the
@@ -287,11 +285,11 @@ first one is used).
 **Compressed files** (`.fits.fz`, as written by `fpack`) work the same way: the image is in extension 1, so pass `hdu=1`.
 
 ```python
-stats = euclid_fast.fits_stats("image.fits.fz", hdu=1)
-cutout = euclid_fast.extract_cutout("image.fits.fz", 150.0, 2.2, 50, 50, hdu=1)   # decodes only the tiles it needs
+stats = euclidrust.fits_stats("image.fits.fz", hdu=1)
+cutout = euclidrust.extract_cutout("image.fits.fz", 150.0, 2.2, 50, 50, hdu=1)   # decodes only the tiles it needs
 ```
 
-Lossy (quantized) floating-point images decode to exactly the values astropy/cfitsio would give, which are not the original pre-compression values; that loss belongs to the format, not to `euclid_fast`.
+Lossy (quantized) floating-point images decode to exactly the values astropy/cfitsio would give, which are not the original pre-compression values; that loss belongs to the format, not to `euclidrust`.
 
 Reference:
 
@@ -321,17 +319,17 @@ parallel on all the cores, with the GIL released:
 
 ```python
 # 1. The same statistics over many files (one result per file, same order)
-results = euclid_fast.fits_stats_many(paths)
-results = euclid_fast.fits_stats_many(paths, hdu=1)               # hdu applies to every file
-results = euclid_fast.fits_stats_many(paths, skip_errors=True)    # None for a file that cannot be read
+results = euclidrust.fits_stats_many(paths)
+results = euclidrust.fits_stats_many(paths, hdu=1)               # hdu applies to every file
+results = euclidrust.fits_stats_many(paths, skip_errors=True)    # None for a file that cannot be read
 
 # 2. Every image HDU of one frame (all the detectors of a Euclid frame)
-for r in euclid_fast.fits_stats_all_hdus("frame.fits", name_contains="SCI"):
+for r in euclidrust.fits_stats_all_hdus("frame.fits", name_contains="SCI"):
     print(r.index, r.name, r.min, r.max, r.mean)
 
 # 3. Many cutouts from one file, e.g. a catalogue of objects
 #    (ras, decs: two equal-length lists or numpy arrays, in degrees)
-cutouts = euclid_fast.extract_cutouts("tile.fits", ras, decs, 50, 50)
+cutouts = euclidrust.extract_cutouts("tile.fits", ras, decs, 50, 50)
 images = [np.array(c.data).reshape(50, 50) for c in cutouts]
 ```
 
@@ -357,7 +355,7 @@ What this buys you, measured on real Euclid data (median of 3 runs, warm
 cache; the 40-file case uses 40 copies of one detector, so everything is in
 the OS cache):
 
-| Task | `astropy` | `euclid_fast`: a loop of single calls | `euclid_fast`: one batch call |
+| Task | `astropy` | `euclidrust`: a loop of single calls | `euclidrust`: one batch call |
 |---|---|---|---|
 | Stats of the 48 image HDUs of a NISP frame (799 MB) | 484 ms | 102 ms | 72 ms |
 | Stats of the 144 image HDUs of a VIS frame (2.4 GB) | 1309 ms | 693 ms | 299 ms |
@@ -381,7 +379,7 @@ that every supported projection, matrix form, the TPV distortion and the SIP
 distortion (including real SIP headers from astropy's own test data) agree with
 astropy/wcslib, and that tile-compressed images (`RICE_1`, `GZIP_1`,
 `GZIP_2`, quantization and dithering) decode exactly like astropy/cfitsio, and
-that the batch functions return what the single calls return. It needs no download. With `euclid_fast`
+that the batch functions return what the single calls return. It needs no download. With `euclidrust`
 installed and `pip install -r scripts/requirements.txt` done:
 
 ```bash
@@ -392,7 +390,7 @@ python tests/test_input_validation.py     # prints "all checks passed"
 
 ## Run the benchmark on your own FITS file
 
-The script `scripts/benchmark_vs_astropy_real.py` times `euclid_fast`
+The script `scripts/benchmark_vs_astropy_real.py` times `euclidrust`
 against `astropy` on a file of your choice, and checks that both give the
 same answer.
 
@@ -411,7 +409,7 @@ a **calibrated frame** instead (images in extensions), these are public too:
 - VIS, 2.4 GB (`TPV` WCS): <https://nasa-irsa-euclid-q1.s3.amazonaws.com/q1/VIS/2681/EUC_VIS_SWL-BKG-002681-00-1-0000000__20241017T042839.727792Z.fits>
 
 **2. Install the benchmark's two dependencies** (inside the same virtual
-environment you installed `euclid_fast` in):
+environment you installed `euclidrust` in):
 
 ```bash
 pip install -r scripts/requirements.txt     # numpy + astropy
@@ -433,7 +431,7 @@ detector frames, for example), the cutout comparison is skipped with an
 explanation and the global-stats comparison still runs. If the file uses
 `BZERO`/`BSCALE`, astropy cannot memory-map it and reads it into RAM; the
 script says so, and the comparison is then less favourable to astropy than
-usual for reasons unrelated to `euclid_fast`.
+usual for reasons unrelated to `euclidrust`.
 
 **4. Read the output.** It prints, for each of the two operations, the median
 time of both tools, the speedup, and a correctness check:
@@ -441,14 +439,14 @@ time of both tools, the speedup, and a correctness check:
 ```
 --- 1. Global stats (min/max/mean over the whole file) ---
 astropy (memmap, numpy)      :   476.49 ms
-euclid_fast (Rust/rayon)     :   130.05 ms
+euclidrust (Rust/rayon)      :   130.05 ms
 Speedup                      : ×3.66  (72.7% less time)
 Result check: astropy min/max/mean = (-111.43283081054688, 15220.939453125, 1.0181564092636108)
               rust    min/max/mean = (-111.43283081054688, 15220.939453125, 1.0181568676826722)
 
 --- 2. 50x50 cutout extraction by RA/Dec (273.071586, 68.000028) ---
 astropy (WCS + memmap)       :    2.670 ms
-euclid_fast (Rust/mmap)      :    0.224 ms
+euclidrust (Rust/mmap)       :    0.224 ms
 Speedup                      : ×11.91  (91.6% less time)
 ...
               all 2500 pixels identical: True
@@ -468,9 +466,9 @@ loads the file into its cache.
 | `rustc: command not found` or pip fails with "Cargo, the Rust package manager, is not installed" | Rust is not installed, or the terminal was opened before installing it. Install via [rustup](https://rustup.rs/) and open a **new** terminal. |
 | Build error mentioning `edition2024` or `rust-version` | Your Rust is older than 1.88. Run `rustup update`. |
 | `linker 'cc' not found` (Linux) / `link.exe not found` (Windows) | Install a C toolchain: `sudo apt install build-essential`, or the Visual Studio C++ Build Tools. |
-| `ModuleNotFoundError: No module named 'euclid_fast'` | You are in a different Python than the one you installed into. Activate the virtual environment (`source .venv/bin/activate`) and retry; check with `pip show euclid_fast`. |
+| `ModuleNotFoundError: No module named 'euclidrust'` | You are in a different Python than the one you installed into. Activate the virtual environment (`source .venv/bin/activate`) and retry; check with `pip show euclidrust`. |
 | `ValueError: the primary HDU holds no image (NAXIS = 0); it contains: ...` | The image is in an extension (Euclid calibrated/raw frames). Pass `hdu=` with the name or index shown in the message. |
-| `ValueError: no HDU named '...'` / `no HDU with index ...` | Wrong `hdu` value. The message lists the available HDUs; `euclid_fast.list_hdus(path)` shows them all. |
+| `ValueError: no HDU named '...'` / `no HDU with index ...` | Wrong `hdu` value. The message lists the available HDUs; `euclidrust.list_hdus(path)` shows them all. |
 | `ValueError: ... tile-compressed image uses ZCMPTYPE = ...` or `... is a BINTABLE table, not an image` | That HDU uses a compression algorithm that is not implemented (only `RICE_1`, `GZIP_1`, `GZIP_2` are), or it is a table. |
 | `ValueError: NAXIS = 3 is not supported` or `no END card found` | A 3-D cube, or a file that is not FITS. Only 2-D images are handled. |
 | `ValueError: unsupported WCS projection ...` | The cutout functions implement the zenithal projections (`TAN`, `SIN`, `ARC`, `STG`, `ZEA`, `ZPN`), `TAN-SIP` and `TPV`. Cylindrical and all-sky projections, and WCS in other coordinate systems (galactic, ecliptic), are not supported yet. |
@@ -496,7 +494,7 @@ consortium's HPC clusters:
   tile often pulls far more data into memory than the cutout itself
   requires.
 
-`euclid_fast` addresses both with a small Rust core: `mmap`-based
+`euclidrust` addresses both with a small Rust core: `mmap`-based
 zero-copy access to uncompressed FITS data, and a `rayon` thread pool that
 auto-sizes itself to the host's logical core count (the GIL is released while it works) — there is no hardcoded
 thread count, so the same binary scales itself from a laptop to a
@@ -534,7 +532,7 @@ have on their desk," not a best-case HPC result. Each number is the
 median of 5 runs after a warm-up pass, so the OS page cache is in a
 comparable state for both tools.
 
-| Operation | `astropy` | `euclid_fast` | Speedup | Time saved |
+| Operation | `astropy` | `euclidrust` | Speedup | Time saved |
 |---|---|---|---|---|
 | Global stats (min/max/mean, full 1.47 GB) | 478.30 ms | 130.35 ms | ×3.67 | −72.7% |
 | Cutout extraction (50×50 px, by RA/Dec) | 2.664 ms | 0.219 ms | ×12.16 | −91.8% |
@@ -578,7 +576,7 @@ were compressed), so the real-data runs use real Euclid images that I
 compressed myself with astropy's `CompImageHDU` (cfitsio underneath), with
 its defaults (quantization level 16, dithering) unless stated:
 
-| Real Euclid data, compressed with astropy | Global stats: `astropy` -> `euclid_fast` | 50×50 cutout: `astropy` (`.section`) -> `euclid_fast` |
+| Real Euclid data, compressed with astropy | Global stats: `astropy` -> `euclidrust` | 50×50 cutout: `astropy` (`.section`) -> `euclidrust` |
 |---|---|---|
 | NISP detector, 2040², `RICE_1` | 78.6 ms -> 14.5 ms (×5.4) | 6.96 ms -> 0.54 ms (×12.9) |
 | NISP detector, `GZIP_2` | 219 ms -> 22.4 ms (×9.8) | 10.5 ms -> 0.80 ms (×13.2) |
@@ -589,7 +587,7 @@ its defaults (quantization level 16, dithering) unless stated:
 Median of 3 runs on the development machine, warm cache. For `astropy`, the
 global stats include decompressing the whole image (single-threaded), which
 is what an astropy user does; the gap is wider than for uncompressed files
-because `euclid_fast` decompresses tiles on all the cores. On the big mosaic
+because `euclidrust` decompresses tiles on all the cores. On the big mosaic
 the tiles are whole image rows (19200 pixels wide), so a cutout still has to
 decode about fifty full rows, which is why the cutout gain is smaller there.
 These are decoding speeds only: the files were produced by cfitsio, and
@@ -702,7 +700,7 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
   memory (the images are memory-mapped, so a laptop with 8 GB of RAM should
   cope with the 1.47 GB tile, but I have not measured it).
 - **No continuous integration, no pre-built packages.** The tests are run by
-  hand. The workflow file in `euclid_fast/.github/` is not at the root of the
+  hand. The workflow file in `euclidrust/.github/` is not at the root of the
   repository, so GitHub never runs it. The package is not on PyPI: you build
   it yourself, which needs a Rust toolchain. The interface is version 0.1.0
   and may change.

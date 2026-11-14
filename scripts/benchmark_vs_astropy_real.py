@@ -1,5 +1,5 @@
 """
-Timed comparison: astropy (the astronomy standard) vs euclid_fast (Rust),
+Timed comparison: astropy (the astronomy standard) vs euclidrust (Rust),
 on the same file and the same operations.
 
 Operations compared:
@@ -45,17 +45,17 @@ except ImportError:
              "    pip install -r scripts/requirements.txt")
 
 try:
-    import euclid_fast
+    import euclidrust
 except ImportError:
-    sys.exit("The euclid_fast module is not installed in this Python environment.\n"
+    sys.exit("The euclidrust module is not installed in this Python environment.\n"
              "Build and install it first, from the project root:\n"
-             "    pip install ./euclid_fast\n"
+             "    pip install ./euclidrust\n"
              "(see the README, section 'Install').")
 
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Benchmark euclid_fast against astropy on a FITS image.")
+    p = argparse.ArgumentParser(description="Benchmark euclidrust against astropy on a FITS image.")
     p.add_argument("file", type=Path, help="path to the FITS image to benchmark")
     p.add_argument("--hdu", type=lambda s: int(s) if s.isdigit() else s, default=None,
                    help="HDU holding the image: an EXTNAME or a 0-based index (default: the primary HDU)")
@@ -114,7 +114,7 @@ def main():
     # --- Warm-up: one pass of each method so the file is in the OS cache ---
     with fits.open(path, memmap=memmap) as hdul:
         _ = hdul[hdu_idx].data.min()
-    _ = euclid_fast.fits_stats(path, hdu=hdu)
+    _ = euclidrust.fits_stats(path, hdu=hdu)
 
     # --- 1. Global stats ---
     def astropy_stats():
@@ -126,12 +126,12 @@ def main():
             return lo, hi, mean
 
     def rust_stats():
-        s = euclid_fast.fits_stats(path, hdu=hdu)
+        s = euclidrust.fits_stats(path, hdu=hdu)
         return s.min, s.max, s.mean
 
     astropy_stats_result = astropy_stats()
     rust_stats_result = rust_stats()
-    n_nan = euclid_fast.fits_stats(path, hdu=hdu).n_nan
+    n_nan = euclidrust.fits_stats(path, hdu=hdu).n_nan
     t_astropy_stats, _ = median_ms(astropy_stats, n_runs)
     t_rust_stats, _ = median_ms(rust_stats, n_runs)
 
@@ -149,7 +149,7 @@ def main():
             return np.array(cutout)  # force the actual read
 
     def rust_cutout():
-        return euclid_fast.extract_cutout(path, ra, dec, size, size, hdu=hdu).data
+        return euclidrust.extract_cutout(path, ra, dec, size, size, hdu=hdu).data
 
     cutout_skipped = None
     if ra is None or dec is None or not np.isfinite([ra, dec]).all():
@@ -163,7 +163,7 @@ def main():
             same_pixels = np.array_equal(
                 astropy_cutout_result.astype(np.float64).ravel(), np.asarray(rust_cutout_result), equal_nan=True
             )
-        except ValueError as e:        # euclid_fast refused the file/position: say why
+        except ValueError as e:        # euclidrust refused the file/position: say why
             cutout_skipped = str(e)
 
     print("=" * 70)
@@ -174,12 +174,12 @@ def main():
     if n_nan:
         print(f"{n_nan:,} NaN pixels: both sides leave them out (astropy side: numpy's nanmin / nanmax / nanmean)")
     print(f"Median over {n_runs} runs, after OS cache warm-up")
-    print(f"CPU threads used by euclid_fast: {euclid_fast.detected_cpus()}")
+    print(f"CPU threads used by euclidrust: {euclidrust.detected_cpus()}")
     print("=" * 70)
 
     print("\n--- 1. Global stats (min/max/mean over the whole file) ---")
     print(f"astropy (memmap, numpy)      : {t_astropy_stats:8.2f} ms")
-    print(f"euclid_fast (Rust/rayon)     : {t_rust_stats:8.2f} ms")
+    print(f"euclidrust (Rust/rayon)      : {t_rust_stats:8.2f} ms")
     print(f"Speedup                      : ×{speedup(t_astropy_stats, t_rust_stats):.2f}  "
           f"({pct_faster(t_astropy_stats, t_rust_stats):.1f}% less time)")
     print(f"Result check: astropy min/max/mean = {astropy_stats_result}")
@@ -191,7 +191,7 @@ def main():
 
     print(f"\n--- 2. {size}x{size} cutout extraction by RA/Dec ({ra:.6f}, {dec:.6f}) ---")
     print(f"astropy (WCS + memmap)       : {t_astropy_cutout:8.3f} ms")
-    print(f"euclid_fast (Rust/mmap)      : {t_rust_cutout:8.3f} ms")
+    print(f"euclidrust (Rust/mmap)       : {t_rust_cutout:8.3f} ms")
     print(f"Speedup                      : ×{speedup(t_astropy_cutout, t_rust_cutout):.2f}  "
           f"({pct_faster(t_astropy_cutout, t_rust_cutout):.1f}% less time)")
     print(f"Result check: astropy min/max = {astropy_cutout_result.min()}/{astropy_cutout_result.max()}")

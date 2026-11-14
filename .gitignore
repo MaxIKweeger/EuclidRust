@@ -10,8 +10,8 @@ data/real/
 __pycache__/
 *.pyc
 
-# Rust build output (also covered by euclid_fast/.gitignore, redundancy is fine)
-euclid_fast/target/
+# Rust build output (also covered by euclidrust/.gitignore, redundancy is fine)
+euclidrust/target/
 
 # Personal notes, not part of the public repo
 base.txt

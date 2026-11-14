@@ -1,11 +1,11 @@
 """
-Tests for euclid_fast: supported inputs work, unsupported ones are rejected
+Tests for euclidrust: supported inputs work, unsupported ones are rejected
 with a clear error (instead of silently giving wrong results), the TPV
 distortion agrees with astropy/wcslib, and tile-compressed images decode to
 exactly what astropy/cfitsio decodes.
 
 Everything is built from small synthetic FITS files, so no download is needed.
-Run from the project root, in the environment where euclid_fast is installed:
+Run from the project root, in the environment where euclidrust is installed:
 
     pip install -r scripts/requirements.txt
     python tests/test_input_validation.py        # plain Python, no pytest needed
@@ -19,7 +19,7 @@ import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
 
-import euclid_fast
+import euclidrust
 
 warnings.simplefilter("ignore")
 
@@ -54,25 +54,25 @@ def raises(fn, *fragments):
 
 
 def cutout(path, **kw):
-    return euclid_fast.extract_cutout(path, RA, DEC, 20, 20, **kw)
+    return euclidrust.extract_cutout(path, RA, DEC, 20, 20, **kw)
 
 
 def test_supported_primary(tmp):
     h = fits.PrimaryHDU(IMG); add_wcs(h.header)
     p = write(tmp, "ok.fits", fits.HDUList([h]))
-    assert abs(euclid_fast.fits_stats(p).mean - float(IMG.mean())) < 1e-3
+    assert abs(euclidrust.fits_stats(p).mean - float(IMG.mean())) < 1e-3
     assert len(cutout(p).data) == 400
 
     h = fits.PrimaryHDU(IMG.astype(np.int16)); add_wcs(h.header)
     h.header["BZERO"], h.header["BSCALE"] = 5.0, 0.5
     p = write(tmp, "int16.fits", fits.HDUList([h]))
-    assert abs(euclid_fast.fits_stats(p).mean - (5.0 + 0.5 * float(IMG.astype(np.int16).mean()))) < 1e-3
+    assert abs(euclidrust.fits_stats(p).mean - (5.0 + 0.5 * float(IMG.astype(np.int16).mean()))) < 1e-3
 
 
 def test_int64(tmp):
     seg = np.random.default_rng(3).integers(0, 5_000_000, (120, 150)).astype(np.int64)
     p = write(tmp, "seg.fits", fits.HDUList([fits.PrimaryHDU(seg)]))
-    s = euclid_fast.fits_stats(p)
+    s = euclidrust.fits_stats(p)
     assert (s.min, s.max) == (float(seg.min()), float(seg.max()))
     assert s.mean == float(seg.astype(np.float64).mean())
     assert s.bitpix == 64
@@ -82,7 +82,7 @@ def test_int64_exact(tmp):
     # 64-bit integers are handled exactly, not through float64.
     # 1. signed values above 2**53, where float64 loses the last bits
     ids = np.array([[2**53 + 1, 2**53 + 3, 5], [7, 2**60 + 1, 9]], dtype=np.int64)
-    s = euclid_fast.fits_stats(write(tmp, "signed.fits", fits.HDUList([fits.PrimaryHDU(ids)])))
+    s = euclidrust.fits_stats(write(tmp, "signed.fits", fits.HDUList([fits.PrimaryHDU(ids)])))
     assert (s.min_int, s.max_int) == (5, 2**60 + 1)
     assert float(2**60 + 1) == s.max                        # the float field is the nearest double
     # 2. unsigned 64-bit (stored as BITPIX 64 with BZERO = 2**63): wrong in the
@@ -90,24 +90,24 @@ def test_int64_exact(tmp):
     u = np.array([[1, 2, 3], [4, 100000000000000, 2**64 - 1]], dtype=np.uint64)
     hu = fits.PrimaryHDU(u)
     assert hu.header["BITPIX"] == 64 and hu.header["BZERO"] == 2**63
-    s = euclid_fast.fits_stats(write(tmp, "unsigned.fits", fits.HDUList([hu])))
+    s = euclidrust.fits_stats(write(tmp, "unsigned.fits", fits.HDUList([hu])))
     assert (s.min_int, s.max_int) == (1, 2**64 - 1)
     assert abs(s.mean - float(u.astype(object).sum()) / 6) <= 1e-9 * s.mean
     # 3. cutouts carry the exact integers in data_int
     lab = (np.arange(200 * 300, dtype=np.uint64).reshape(200, 300) + np.uint64(2**62) + np.uint64(1))
     hl = fits.PrimaryHDU(lab); add_wcs(hl.header)
     p = write(tmp, "labels.fits", fits.HDUList([hl]))
-    c = euclid_fast.extract_cutout(p, RA, DEC, 6, 4)
+    c = euclidrust.extract_cutout(p, RA, DEC, 6, 4)
     x0, y0 = int(round(c.pixel_x_center - 1 - 3)), int(round(c.pixel_y_center - 1 - 2))
     truth = [int(v) for v in lab[y0:y0 + 4, x0:x0 + 6].ravel()]
     assert c.data_int == truth
     assert sum(int(f) != i for f, i in zip(c.data, truth)) > 0           # float64 alone could not hold them
-    many = euclid_fast.extract_cutouts(p, [RA, RA], [DEC, DEC], 6, 4)
+    many = euclidrust.extract_cutouts(p, [RA, RA], [DEC, DEC], 6, 4)
     assert all(m.data_int == truth for m in many)
     # 4. other pixel types have no exact-integer fields
     h2 = fits.PrimaryHDU(IMG); add_wcs(h2.header)
     p2 = write(tmp, "float.fits", fits.HDUList([h2]))
-    assert euclid_fast.fits_stats(p2).min_int is None and cutout(p2).data_int is None
+    assert euclidrust.fits_stats(p2).min_int is None and cutout(p2).data_int is None
 
 
 def test_int64_exact_more(tmp):
@@ -117,13 +117,13 @@ def test_int64_exact_more(tmp):
     raw[0, 0] = 2**62 + 1
     for k, (bscale, bzero) in enumerate(((2, 0), (3, 7), (-1, 100), (-5, -2**63), (1, 2**63))):
         h = fits.PrimaryHDU(raw); h.header["BSCALE"] = bscale; h.header["BZERO"] = bzero
-        s = euclid_fast.fits_stats(write(tmp, f"aff{k}.fits", fits.HDUList([h])))
+        s = euclidrust.fits_stats(write(tmp, f"aff{k}.fits", fits.HDUList([h])))
         phys = [bzero + bscale * int(v) for v in raw.ravel()]
         assert (s.min_int, s.max_int) == (min(phys), max(phys)), (bscale, bzero)
         assert abs(s.mean - sum(phys) / len(phys)) <= 1e-12 * max(1.0, abs(sum(phys) / len(phys)))
     for k, (bscale, bzero) in enumerate(((0.5, 0), (1, 0.5))):      # not whole numbers: float64 only
         h = fits.PrimaryHDU(raw); h.header["BSCALE"] = bscale; h.header["BZERO"] = bzero
-        assert euclid_fast.fits_stats(write(tmp, f"frac{k}.fits", fits.HDUList([h]))).min_int is None
+        assert euclidrust.fits_stats(write(tmp, f"frac{k}.fits", fits.HDUList([h]))).min_int is None
 
     # 2. tile-compressed 64-bit images (cfitsio only allows gzip for them)
     lab = np.arange(60 * 80, dtype=np.int64).reshape(60, 80) * 7919 + 2**60 + 1
@@ -132,10 +132,10 @@ def test_int64_exact_more(tmp):
     cases = [(lab, algo, kw) for algo in ("GZIP_1", "GZIP_2") for kw in ({}, {"tile_shape": (16, 24)})] + [(u, "GZIP_2", {})]
     for k, (arr, algo, kw) in enumerate(cases):
         p = write(tmp, f"c64_{k}.fits", fits.HDUList([fits.PrimaryHDU(), fits.CompImageHDU(arr, header=hdr, compression_type=algo, **kw)]))
-        assert euclid_fast.list_hdus(p)[1].readable
-        s = euclid_fast.fits_stats(p, hdu=1)
+        assert euclidrust.list_hdus(p)[1].readable
+        s = euclidrust.fits_stats(p, hdu=1)
         assert (s.min_int, s.max_int) == (int(arr.min()), int(arr.max())), (algo, kw)
-        c = euclid_fast.extract_cutout(p, RA, DEC, 6, 4, hdu=1)
+        c = euclidrust.extract_cutout(p, RA, DEC, 6, 4, hdu=1)
         x0, y0 = int(round(c.pixel_x_center - 1 - 3)), int(round(c.pixel_y_center - 1 - 2))
         assert c.data_int == [int(v) for v in arr[y0:y0 + 4, x0:x0 + 6].ravel()], (algo, kw)
 
@@ -149,9 +149,9 @@ def test_int64_exact_more(tmp):
         h.header["CRPIX1"], h.header["CRPIX2"] = arr.shape[1] / 2, arr.shape[0] / 2     # sky position at the image center
         p = write(tmp, f"pq{k}.fits", fits.HDUList([h]))
         out = str(Path(tmp) / f"pq{k}.parquet")
-        euclid_fast.export_cutout_parquet(p, RA, DEC, 6, 4, out)
+        euclidrust.export_cutout_parquet(p, RA, DEC, 6, 4, out)
         col = pq.read_table(out).column("value")
-        c = euclid_fast.extract_cutout(p, RA, DEC, 6, 4)
+        c = euclidrust.extract_cutout(p, RA, DEC, 6, 4)
         assert str(col.type) == kind, (kind, col.type)
         assert col.to_pylist() == (c.data_int if c.data_int is not None else c.data)
 
@@ -164,28 +164,28 @@ def test_nan_pixels(tmp):
     a[5, 5] = np.nan
     a[20:25, 10:15] = np.nan
     p = write(tmp, "nan.fits", fits.HDUList([fits.PrimaryHDU(a)]))
-    s = euclid_fast.fits_stats(p)
+    s = euclidrust.fits_stats(p)
     assert (s.min, s.max) == (float(np.nanmin(a)), float(np.nanmax(a)))
     assert abs(s.mean - float(np.nanmean(a, dtype=np.float64))) < 1e-9 and s.n_nan == 26
-    assert euclid_fast.fits_stats_many([p])[0].n_nan == 26
+    assert euclidrust.fits_stats_many([p])[0].n_nan == 26
     # the file with no NaN takes the same answer as plain numpy
     clean = write(tmp, "clean.fits", fits.HDUList([fits.PrimaryHDU(np.nan_to_num(a, nan=10.0))]))
-    assert euclid_fast.fits_stats(clean).n_nan == 0
+    assert euclidrust.fits_stats(clean).n_nan == 0
     # all NaN: no valid pixel, so no statistics
-    s = euclid_fast.fits_stats(write(tmp, "allnan.fits", fits.HDUList([fits.PrimaryHDU(np.full((10, 10), np.nan, np.float32))])))
+    s = euclidrust.fits_stats(write(tmp, "allnan.fits", fits.HDUList([fits.PrimaryHDU(np.full((10, 10), np.nan, np.float32))])))
     assert np.isnan(s.min) and np.isnan(s.max) and np.isnan(s.mean) and s.n_nan == 100
     # integer images have no NaN
-    s = euclid_fast.fits_stats(write(tmp, "int.fits", fits.HDUList([fits.PrimaryHDU(np.arange(100, dtype=np.int16).reshape(10, 10))])))
+    s = euclidrust.fits_stats(write(tmp, "int.fits", fits.HDUList([fits.PrimaryHDU(np.arange(100, dtype=np.int16).reshape(10, 10))])))
     assert s.n_nan == 0
     # infinity is a value
     inf = np.ones((10, 10), np.float32)
     inf[0, 0] = np.inf
-    s = euclid_fast.fits_stats(write(tmp, "inf.fits", fits.HDUList([fits.PrimaryHDU(inf)])))
+    s = euclidrust.fits_stats(write(tmp, "inf.fits", fits.HDUList([fits.PrimaryHDU(inf)])))
     assert s.max == np.inf and s.n_nan == 0
     # a frame: every HDU reports its own count
     sci = fits.ImageHDU(a, name="DET11.SCI")
     fr = write(tmp, "nanframe.fits", fits.HDUList([fits.PrimaryHDU(), sci]))
-    assert [r.n_nan for r in euclid_fast.fits_stats_all_hdus(fr)] == [26]
+    assert [r.n_nan for r in euclidrust.fits_stats_all_hdus(fr)] == [26]
 
 
 def test_lookup_table_distortion_is_refused(tmp):
@@ -194,7 +194,7 @@ def test_lookup_table_distortion_is_refused(tmp):
     for key in ("CPDIS1", "D2IMDIS2"):
         h = fits.PrimaryHDU(IMG); add_wcs(h.header); h.header[key] = "Lookup"
         p = write(tmp, f"lookup_{key}.fits", fits.HDUList([h]))
-        assert euclid_fast.fits_stats(p).naxis1 == 300
+        assert euclidrust.fits_stats(p).naxis1 == 300
         raises(lambda: cutout(p), "lookup tables")
 
 
@@ -205,24 +205,24 @@ def test_extensions(tmp):
     dq = fits.ImageHDU((IMG > 100).astype(np.uint8), name="DET11.DQ")
     p = write(tmp, "frame.fits", fits.HDUList([fits.PrimaryHDU(), sci, rms, dq]))
 
-    infos = euclid_fast.list_hdus(p)
+    infos = euclidrust.list_hdus(p)
     assert [(i.index, i.name, i.readable) for i in infos] == [
         (0, "", False), (1, "DET11.SCI", True), (2, "DET11.RMS", True), (3, "DET11.DQ", True)]
     assert infos[1].shape == [300, 200] and infos[1].bitpix == -32 and infos[3].bitpix == 8
 
     for sel, ref in (("DET11.SCI", IMG), (1, IMG), ("det11.rms", IMG * 2), (2, IMG * 2)):
-        assert abs(euclid_fast.fits_stats(p, hdu=sel).mean - float(ref.astype(np.float64).mean())) < 1e-3
-    assert euclid_fast.fits_stats(p, hdu="DET11.DQ").bitpix == 8
+        assert abs(euclidrust.fits_stats(p, hdu=sel).mean - float(ref.astype(np.float64).mean())) < 1e-3
+    assert euclidrust.fits_stats(p, hdu="DET11.DQ").bitpix == 8
 
     c = cutout(p, hdu="DET11.SCI")
     x0, y0 = int(round(c.pixel_x_center - 1 - 10)), int(round(c.pixel_y_center - 1 - 10))
     assert np.array_equal(np.array(c.data).reshape(20, 20), IMG[y0:y0 + 20, x0:x0 + 20].astype(np.float64))
 
     # No hdu given on a file with an empty primary: explain what to pass.
-    raises(lambda: euclid_fast.fits_stats(p), "NAXIS = 0", "DET11.SCI", "hdu=")
+    raises(lambda: euclidrust.fits_stats(p), "NAXIS = 0", "DET11.SCI", "hdu=")
     raises(lambda: cutout(p), "NAXIS = 0", "hdu=")
-    raises(lambda: euclid_fast.fits_stats(p, hdu="NOPE"), "no HDU named 'NOPE'", "DET11.SCI")
-    raises(lambda: euclid_fast.fits_stats(p, hdu=9), "no HDU with index 9", "4 HDU")
+    raises(lambda: euclidrust.fits_stats(p, hdu="NOPE"), "no HDU named 'NOPE'", "DET11.SCI")
+    raises(lambda: euclidrust.fits_stats(p, hdu=9), "no HDU with index 9", "4 HDU")
     # An extension without WCS: stats work, cutouts do not.
     raises(lambda: cutout(p, hdu="DET11.RMS"), "no WCS header")
 
@@ -232,27 +232,27 @@ def test_unreadable_hdus(tmp):
     # an extension: without hdu= the error points at it.
     comp = fits.CompImageHDU(IMG, compression_type="RICE_1", name="SCI")
     p = write(tmp, "compressed.fits", fits.HDUList([fits.PrimaryHDU(), comp]))
-    raises(lambda: euclid_fast.fits_stats(p), "NAXIS = 0", "tile-compressed RICE_1", "hdu=")
-    info = euclid_fast.list_hdus(p)[1]
+    raises(lambda: euclidrust.fits_stats(p), "NAXIS = 0", "tile-compressed RICE_1", "hdu=")
+    info = euclidrust.list_hdus(p)[1]
     assert info.readable and "tile-compressed RICE_1" in info.note and info.shape == [300, 200]
 
     # Compression algorithms that are not implemented are refused with a clear message.
     hc = fits.CompImageHDU(IMG, compression_type="HCOMPRESS_1", name="SCI")
     p = write(tmp, "hcompress.fits", fits.HDUList([fits.PrimaryHDU(), hc]))
-    raises(lambda: euclid_fast.fits_stats(p, hdu=1), "HCOMPRESS_1", "not supported yet")
-    info = euclid_fast.list_hdus(p)[1]
+    raises(lambda: euclidrust.fits_stats(p, hdu=1), "HCOMPRESS_1", "not supported yet")
+    info = euclidrust.list_hdus(p)[1]
     assert not info.readable and "HCOMPRESS_1" in info.note
 
     table = fits.BinTableHDU.from_columns([fits.Column(name="a", format="E", array=np.arange(5, dtype=np.float32))])
     p = write(tmp, "table.fits", fits.HDUList([fits.PrimaryHDU(), table]))
-    raises(lambda: euclid_fast.fits_stats(p, hdu=1), "BINTABLE table, not an image")
+    raises(lambda: euclidrust.fits_stats(p, hdu=1), "BINTABLE table, not an image")
 
 
 def test_rejected_inputs(tmp):
     # 3-D cube (used to be read as its first plane only)
     h = fits.PrimaryHDU(np.stack([IMG, IMG + 1, IMG + 2])); add_wcs(h.header)
     p = write(tmp, "cube.fits", fits.HDUList([h]))
-    raises(lambda: euclid_fast.fits_stats(p), "NAXIS = 3", "2-D")
+    raises(lambda: euclidrust.fits_stats(p), "NAXIS = 3", "2-D")
     raises(lambda: cutout(p), "NAXIS = 3")
 
     # Projections that are not implemented (cylindrical, all-sky...), or a mismatched pair
@@ -260,7 +260,7 @@ def test_rejected_inputs(tmp):
                         ("mixed.fits", ("RA---TAN", "DEC--SIN"))):
         h = fits.PrimaryHDU(IMG); add_wcs(h.header, ctype=ctype)
         p = write(tmp, name, fits.HDUList([h]))
-        assert euclid_fast.fits_stats(p).naxis1 == 300      # stats need no WCS
+        assert euclidrust.fits_stats(p).naxis1 == 300      # stats need no WCS
         raises(lambda: cutout(p), "unsupported WCS projection", ctype[0])
 
     h = fits.PrimaryHDU(IMG)                                # no CTYPE at all
@@ -272,12 +272,12 @@ def test_rejected_inputs(tmp):
     # No WCS at all: stats ok, cutout rejected
     h = fits.PrimaryHDU(IMG)
     p = write(tmp, "nowcs.fits", fits.HDUList([h]))
-    assert euclid_fast.fits_stats(p).naxis2 == 200
+    assert euclidrust.fits_stats(p).naxis2 == 200
     raises(lambda: cutout(p), "no WCS header")
 
     p = str(Path(tmp) / "notfits.fits"); Path(p).write_bytes(b"hello" * 1000)
-    raises(lambda: euclid_fast.fits_stats(p), "no END card")
-    raises(lambda: euclid_fast.fits_stats(str(Path(tmp) / "missing.fits")), "cannot open")
+    raises(lambda: euclidrust.fits_stats(p), "no END card")
+    raises(lambda: euclidrust.fits_stats(str(Path(tmp) / "missing.fits")), "cannot open")
 
 
 def test_tpv_matches_astropy(tmp):
@@ -299,7 +299,7 @@ def test_tpv_matches_astropy(tmp):
     ras, decs = wcs.all_pix2world(xs, ys, 1)
     worst = 0.0
     for x, y, ra, dec in zip(xs, ys, ras, decs):
-        c = euclid_fast.extract_cutout(p, float(ra), float(dec), 5, 5)
+        c = euclidrust.extract_cutout(p, float(ra), float(dec), 5, 5)
         worst = max(worst, abs(c.pixel_x_center - x), abs(c.pixel_y_center - y))
     shift = np.hypot(*(np.array(WCS(h.header.copy()).all_world2pix(ras, decs, 1)) - np.array([xs, ys]))).max()
     assert worst < 1e-5, f"TPV disagrees with astropy by up to {worst} px"
@@ -307,7 +307,7 @@ def test_tpv_matches_astropy(tmp):
 
 
 def _compressed_roundtrip(tmp, name, data, check_mean=True, **kw):
-    """Compress with astropy (cfitsio), then check euclid_fast decodes the same pixels."""
+    """Compress with astropy (cfitsio), then check euclidrust decodes the same pixels."""
     hdr = fits.Header()
     hdr["CTYPE1"], hdr["CTYPE2"] = "RA---TAN", "DEC--TAN"
     hdr["CRVAL1"], hdr["CRVAL2"] = RA, DEC
@@ -317,7 +317,7 @@ def _compressed_roundtrip(tmp, name, data, check_mean=True, **kw):
     with fits.open(p) as hl:
         ref = np.array(hl[1].data).astype(np.float64)
         wcs = WCS(hl[1].header)
-    s = euclid_fast.fits_stats(p, hdu=1)
+    s = euclidrust.fits_stats(p, hdu=1)
     assert (s.min, s.max) == (float(np.nanmin(ref)), float(np.nanmax(ref))), (name, s.min, s.max)
     if check_mean:
         ref_mean = float(np.nanmean(ref))
@@ -326,7 +326,7 @@ def _compressed_roundtrip(tmp, name, data, check_mean=True, **kw):
     ny, nx = ref.shape
     for fx, fy in ((0.3, 0.25), (0.62, 0.5), (0.5, 0.8), (0.85, 0.6)):       # tile borders, off-center
         ra, dec = wcs.all_pix2world(fx * nx, fy * ny, 1)
-        c = euclid_fast.extract_cutout(p, float(ra), float(dec), 17, 13, hdu=1)
+        c = euclidrust.extract_cutout(p, float(ra), float(dec), 17, 13, hdu=1)
         x0 = int(round(c.pixel_x_center - 1 - 17 / 2)); y0 = int(round(c.pixel_y_center - 1 - 13 / 2))
         got = np.array(c.data).reshape(13, 17)
         assert np.array_equal(got, ref[y0:y0 + 13, x0:x0 + 17], equal_nan=True), (name, "cutout", fx, fy)
@@ -396,15 +396,15 @@ def _wcs_header(code, crval, scale, rot=0.0, form="CD", n=(400, 300), lonpole=No
 
 def _check_wcs_roundtrip(tmp, name, header, n=(400, 300), npos=40, margin=10, tol=1e-6, seed=0):
     """Sky positions computed by astropy/wcslib for known pixels must be turned back
-    into those pixels by euclid_fast."""
+    into those pixels by euclidrust."""
     p = write(tmp, name, fits.HDUList([fits.PrimaryHDU(np.zeros((n[1], n[0]), np.float32), header=header)]))
     wcs = WCS(fits.getheader(p))
     rng = np.random.default_rng(seed)
     xs, ys = rng.uniform(margin, n[0] - margin, npos), rng.uniform(margin, n[1] - margin, npos)
     ras, decs = wcs.all_pix2world(xs, ys, 1)
-    got = euclid_fast.extract_cutouts(p, list(ras), list(decs), 3, 3)
+    got = euclidrust.extract_cutouts(p, list(ras), list(decs), 3, 3)
     worst = max(max(abs(c.pixel_x_center - x), abs(c.pixel_y_center - y)) for c, x, y in zip(got, xs, ys))
-    assert worst < tol, f"{name}: euclid_fast disagrees with wcslib by up to {worst} px"
+    assert worst < tol, f"{name}: euclidrust disagrees with wcslib by up to {worst} px"
 
 
 def test_wcs_matches_astropy(tmp):
@@ -463,13 +463,13 @@ def test_batch(tmp):
     for k in range(6):
         h = fits.PrimaryHDU((IMG + 10 * k).astype(np.float32)); add_wcs(h.header)
         paths.append(write(tmp, f"many{k}.fits", fits.HDUList([h])))
-    many = euclid_fast.fits_stats_many(paths)
-    assert len(many) == 6 and all(_same_stats(m, euclid_fast.fits_stats(p)) for m, p in zip(many, paths))
-    assert euclid_fast.fits_stats_many([]) == []
+    many = euclidrust.fits_stats_many(paths)
+    assert len(many) == 6 and all(_same_stats(m, euclidrust.fits_stats(p)) for m, p in zip(many, paths))
+    assert euclidrust.fits_stats_many([]) == []
 
     missing = str(Path(tmp) / "nope.fits")
-    raises(lambda: euclid_fast.fits_stats_many(paths + [missing]), "nope.fits", "cannot open")
-    mixed = euclid_fast.fits_stats_many(paths[:2] + [missing] + paths[2:], skip_errors=True)
+    raises(lambda: euclidrust.fits_stats_many(paths + [missing]), "nope.fits", "cannot open")
+    mixed = euclidrust.fits_stats_many(paths[:2] + [missing] + paths[2:], skip_errors=True)
     assert mixed[2] is None and [m is None for m in mixed].count(True) == 1
 
     # `hdu` applies to every file (here: files whose images are in an extension)
@@ -477,9 +477,9 @@ def test_batch(tmp):
     for k in range(3):
         sci = fits.ImageHDU((IMG * (k + 1)).astype(np.float32), name="DET11.SCI"); add_wcs(sci.header)
         ext_paths.append(write(tmp, f"ext{k}.fits", fits.HDUList([fits.PrimaryHDU(), sci])))
-    res = euclid_fast.fits_stats_many(ext_paths, hdu="DET11.SCI")
+    res = euclidrust.fits_stats_many(ext_paths, hdu="DET11.SCI")
     assert [round(r.mean, 2) for r in res] == [round(float(IMG.mean()) * (k + 1), 2) for k in range(3)]
-    raises(lambda: euclid_fast.fits_stats_many(ext_paths), "ext0.fits", "NAXIS = 0")
+    raises(lambda: euclidrust.fits_stats_many(ext_paths), "ext0.fits", "NAXIS = 0")
 
     # --- fits_stats_all_hdus: every image HDU of a frame, in file order ---
     hdus = [fits.PrimaryHDU()]
@@ -489,43 +489,43 @@ def test_batch(tmp):
                  fits.ImageHDU((IMG > 100).astype(np.uint8), name=f"{det}.DQ")]
     hdus.append(fits.BinTableHDU.from_columns([fits.Column(name="a", format="E", array=np.arange(3, dtype=np.float32))]))
     frame = write(tmp, "frame9.fits", fits.HDUList(hdus))
-    allres = euclid_fast.fits_stats_all_hdus(frame)
+    allres = euclidrust.fits_stats_all_hdus(frame)
     assert [r.index for r in allres] == list(range(1, 10))            # primary and table are skipped
     assert [r.name for r in allres[:3]] == ["DET11.SCI", "DET11.RMS", "DET11.DQ"]
     for r in allres:
-        s = euclid_fast.fits_stats(frame, hdu=r.index)
+        s = euclidrust.fits_stats(frame, hdu=r.index)
         assert (r.min, r.max, r.mean, r.naxis1, r.naxis2, r.bitpix) == (s.min, s.max, s.mean, s.naxis1, s.naxis2, s.bitpix)
-    assert [r.name for r in euclid_fast.fits_stats_all_hdus(frame, name_contains="sci")] == \
+    assert [r.name for r in euclidrust.fits_stats_all_hdus(frame, name_contains="sci")] == \
         ["DET11.SCI", "DET12.SCI", "DET21.SCI"]
-    assert euclid_fast.fits_stats_all_hdus(frame, name_contains="nothing-matches") == []
+    assert euclidrust.fits_stats_all_hdus(frame, name_contains="nothing-matches") == []
 
     # --- extract_cutouts: many positions from one file ---
     wcs = WCS(fits.getheader(paths[0]))
     pix = [(60.3, 50.7), (200.0, 120.0), (150.5, 99.5), (5.0, 5.0), (300.0, 190.0), (-50.0, 40.0), (100.0, 60.0)]
     ras, decs = (list(v) for v in wcs.all_pix2world([p[0] for p in pix], [p[1] for p in pix], 1))
-    batch = euclid_fast.extract_cutouts(paths[0], ras, decs, 17, 13, skip_errors=True)
+    batch = euclidrust.extract_cutouts(paths[0], ras, decs, 17, 13, skip_errors=True)
     assert len(batch) == len(pix)
     for (ra, dec), b in zip(zip(ras, decs), batch):
         try:
-            single = euclid_fast.extract_cutout(paths[0], ra, dec, 17, 13)
+            single = euclidrust.extract_cutout(paths[0], ra, dec, 17, 13)
         except ValueError:
             assert b is None                                     # outside the image
             continue
         assert b.data == single.data and (b.pixel_x_center, b.pixel_y_center) == (single.pixel_x_center, single.pixel_y_center)
         assert (b.width, b.height) == (17, 13)
     assert any(b is None for b in batch) and sum(b is not None for b in batch) >= 4
-    raises(lambda: euclid_fast.extract_cutouts(paths[0], ras, decs, 17, 13), "position", "outside the image")
-    raises(lambda: euclid_fast.extract_cutouts(paths[0], ras, decs[:-1], 17, 13), "same length")
-    assert euclid_fast.extract_cutouts(paths[0], [], [], 17, 13) == []
+    raises(lambda: euclidrust.extract_cutouts(paths[0], ras, decs, 17, 13), "position", "outside the image")
+    raises(lambda: euclidrust.extract_cutouts(paths[0], ras, decs[:-1], 17, 13), "same length")
+    assert euclidrust.extract_cutouts(paths[0], [], [], 17, 13) == []
     # numpy arrays are accepted, and so are compressed images and extensions
-    got = euclid_fast.extract_cutouts(paths[0], np.array(ras[:3]), np.array(decs[:3]), 5, 5)
+    got = euclidrust.extract_cutouts(paths[0], np.array(ras[:3]), np.array(decs[:3]), 5, 5)
     assert len(got) == 3
     comp = fits.CompImageHDU(IMG, header=fits.getheader(paths[0]), compression_type="RICE_1")
     cp = write(tmp, "batch_comp.fits", fits.HDUList([fits.PrimaryHDU(), comp]))
-    cb = euclid_fast.extract_cutouts(cp, ras, decs, 17, 13, hdu=1, skip_errors=True)
+    cb = euclidrust.extract_cutouts(cp, ras, decs, 17, 13, hdu=1, skip_errors=True)
     for (ra, dec), b in zip(zip(ras, decs), cb):
         try:
-            single = euclid_fast.extract_cutout(cp, ra, dec, 17, 13, hdu=1)
+            single = euclidrust.extract_cutout(cp, ra, dec, 17, 13, hdu=1)
         except ValueError:
             assert b is None
             continue

@@ -1,4 +1,4 @@
-# euclid_fast
+# euclidrust
 
 High-performance FITS I/O for Python, written in Rust and exposed with
 [PyO3](https://pyo3.rs/). This directory is the Rust crate and Python
@@ -10,11 +10,11 @@ pip install .        # run from this directory; needs a Rust toolchain (>= 1.88)
 ```
 
 ```python
-import euclid_fast
+import euclidrust
 
-stats = euclid_fast.fits_stats("tile.fits")                    # min / max / mean
-cutout = euclid_fast.extract_cutout("tile.fits", 83.82, -5.39, 50, 50)  # RA/Dec cutout
-euclid_fast.export_cutout_parquet("tile.fits", 83.82, -5.39, 50, 50, "cutout.parquet")
+stats = euclidrust.fits_stats("tile.fits")                    # min / max / mean
+cutout = euclidrust.extract_cutout("tile.fits", 83.82, -5.39, 50, 50)  # RA/Dec cutout
+euclidrust.export_cutout_parquet("tile.fits", 83.82, -5.39, 50, 50, "cutout.parquet")
 ```
 
 See the [repository README](../README.md) for installation details, usage,

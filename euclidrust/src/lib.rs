@@ -1188,7 +1188,7 @@ struct HduInfo {
     #[pyo3(get)]
     shape: Vec<usize>, // (NAXIS1, NAXIS2, ...) in FITS order
     #[pyo3(get)]
-    readable: bool, // True if euclid_fast can read it (2-D image, supported BITPIX / compression)
+    readable: bool, // True if euclidrust can read it (2-D image, supported BITPIX / compression)
     #[pyo3(get)]
     note: String, // e.g. "tile-compressed RICE_1", or why it is not readable
 }
@@ -1213,7 +1213,7 @@ impl HduInfo {
 }
 
 /// Lists the HDUs of a FITS file (reading headers only), so you can see which
-/// ones `euclid_fast` can read and what to pass as `hdu=`.
+/// ones `euclidrust` can read and what to pass as `hdu=`.
 #[pyfunction]
 fn list_hdus(path: &str) -> PyResult<Vec<HduInfo>> {
     let mmap = open_mmap(path)?;
@@ -1481,7 +1481,7 @@ fn fits_stats_many(
     Ok(out)
 }
 
-/// Whether an HDU is an image that `euclid_fast` can read.
+/// Whether an HDU is an image that `euclidrust` can read.
 fn is_readable(h: &RawHeader, data_offset: usize) -> bool {
     if is_compressed_image(h) {
         return build_tiled(h, data_offset).is_ok();
@@ -2002,7 +2002,7 @@ fn cutout_at(
         return err(msg.clone());
     }
     if header.lookup_distortion {
-        return err("this header declares distortion corrections stored in lookup tables (CPDIS / D2IMDIS keywords, as in HST files), which euclid_fast does not apply: cutout positions would be off");
+        return err("this header declares distortion corrections stored in lookup tables (CPDIS / D2IMDIS keywords, as in HST files), which euclidrust does not apply: cutout positions would be off");
     }
     let wcs = header.wcs.as_ref().ok_or_else(|| {
         PyValueError::new_err("this file has no WCS header (CRVAL, CRPIX and either a CD matrix or CDELT/PC)")
@@ -2304,9 +2304,9 @@ fn detected_cpus() -> usize {
     num_cpus::get()
 }
 
-/// The Python module exposed to users (`import euclid_fast`).
+/// The Python module exposed to users (`import euclidrust`).
 #[pymodule]
-fn euclid_fast(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn euclidrust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fits_stats, m)?)?;
     m.add_function(wrap_pyfunction!(extract_cutout, m)?)?;
     m.add_function(wrap_pyfunction!(export_cutout_parquet, m)?)?;

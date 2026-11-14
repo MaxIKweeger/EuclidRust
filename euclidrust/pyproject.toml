@@ -3,7 +3,7 @@ requires = ["maturin>=1.16,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "euclid_fast"
+name = "euclidrust"
 requires-python = ">=3.8"
 license = "MIT"
 license-files = ["LICENSE"]
