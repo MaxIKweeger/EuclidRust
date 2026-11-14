@@ -5,25 +5,25 @@ use rayon::prelude::*;
 use std::fs::File;
 
 const CARD_LEN: usize = 80;
-const BLOCK_LEN: usize = 2880; // 36 cards de 80 octets
+const BLOCK_LEN: usize = 2880; // 36 cards of 80 bytes
 
-/// Paramètres WCS (World Coordinate System) : la transformation standard
-/// FITS "pixel <-> coordonnées célestes" en projection tangentielle (TAN).
-/// Absents si le fichier n'a pas d'astrométrie moderne (ex: horsehead.fits
-/// qui utilise une vieille astrométrie de plaque non standard).
+/// WCS (World Coordinate System) parameters: the standard FITS
+/// "pixel <-> sky coordinates" transformation, using the tangent (TAN)
+/// projection. Absent (`None`) if the file has no modern astrometry, e.g.
+/// old plate-solution headers that use non-standard keywords.
 #[derive(Debug, Clone, Copy)]
 struct Wcs {
-    crval1: f64, // RA du pixel de référence, en degrés
-    crval2: f64, // Dec du pixel de référence, en degrés
-    crpix1: f64, // pixel de référence, axe 1 (convention FITS, 1-indexé)
-    crpix2: f64, // pixel de référence, axe 2
-    cd1_1: f64,  // matrice WCS, degrés/pixel
+    crval1: f64, // RA of the reference pixel, in degrees
+    crval2: f64, // Dec of the reference pixel, in degrees
+    crpix1: f64, // reference pixel, axis 1 (FITS convention, 1-indexed)
+    crpix2: f64, // reference pixel, axis 2
+    cd1_1: f64,  // WCS matrix, degrees/pixel
     cd1_2: f64,
     cd2_1: f64,
     cd2_2: f64,
 }
 
-/// En-tête FITS minimal dont on a besoin pour lire la matrice de pixels.
+/// Minimal FITS header: only what is needed to read the pixel array.
 #[derive(Debug, Clone, Copy)]
 struct FitsHeader {
     bitpix: i32,
@@ -31,13 +31,13 @@ struct FitsHeader {
     naxis2: usize,
     bzero: f64,
     bscale: f64,
-    data_offset: usize, // position en octets où commencent les pixels
+    data_offset: usize, // byte offset where the pixels start
     wcs: Option<Wcs>,
 }
 
-/// Parse les cartes d'en-tête FITS (blocs de 2880 octets = 36 cartes de 80
-/// octets) jusqu'à la carte "END". Ne gère que les images simples (1 HDU,
-/// NAXIS=2, pas d'extensions) : suffisant pour notre jeu de données de dev.
+/// Parses the FITS header cards (2880-byte blocks = 36 cards of 80 bytes)
+/// up to the "END" card. Only handles simple images (single HDU, NAXIS=2,
+/// no extensions), which is what the supported Euclid mosaics look like.
 fn parse_header(mmap: &[u8]) -> PyResult<FitsHeader> {
     let mut bitpix: Option<i32> = None;
     let mut naxis1: Option<usize> = None;
@@ -57,7 +57,7 @@ fn parse_header(mmap: &[u8]) -> PyResult<FitsHeader> {
     'blocks: loop {
         if block_start + BLOCK_LEN > mmap.len() {
             return Err(PyValueError::new_err(
-                "fichier tronqué : pas de carte END trouvée",
+                "truncated file: no END card found",
             ));
         }
         let block = &mmap[block_start..block_start + BLOCK_LEN];
@@ -68,9 +68,9 @@ fn parse_header(mmap: &[u8]) -> PyResult<FitsHeader> {
 
             if keyword == "END" {
                 let data_offset = block_start + BLOCK_LEN;
-                let bitpix = bitpix.ok_or_else(|| PyValueError::new_err("BITPIX manquant"))?;
-                let naxis1 = naxis1.ok_or_else(|| PyValueError::new_err("NAXIS1 manquant"))?;
-                let naxis2 = naxis2.ok_or_else(|| PyValueError::new_err("NAXIS2 manquant"))?;
+                let bitpix = bitpix.ok_or_else(|| PyValueError::new_err("missing BITPIX"))?;
+                let naxis1 = naxis1.ok_or_else(|| PyValueError::new_err("missing NAXIS1"))?;
+                let naxis2 = naxis2.ok_or_else(|| PyValueError::new_err("missing NAXIS2"))?;
                 let wcs = match (crval1, crval2, crpix1, crpix2, cd1_1, cd2_2) {
                     (Some(crval1), Some(crval2), Some(crpix1), Some(crpix2), Some(cd1_1), Some(cd2_2)) => {
                         Some(Wcs {
@@ -120,15 +120,15 @@ fn parse_header(mmap: &[u8]) -> PyResult<FitsHeader> {
         }
         block_start += BLOCK_LEN;
         if block_start > 50 * BLOCK_LEN {
-            // Garde-fou : un en-tête FITS raisonnable ne dépasse pas ça.
+            // Safety guard: a sane FITS header is never this long.
             break 'blocks;
         }
     }
-    Err(PyValueError::new_err("carte END introuvable"))
+    Err(PyValueError::new_err("END card not found"))
 }
 
-/// Statistiques calculées sur l'image : min, max, moyenne (valeurs physiques
-/// après application de BZERO/BSCALE), + infos de contexte sur le calcul.
+/// Image statistics: min, max, mean (physical values, after applying
+/// BZERO/BSCALE), plus some context about the computation.
 #[pyclass]
 struct FitsStats {
     #[pyo3(get)]
@@ -149,18 +149,18 @@ struct FitsStats {
     elapsed_ms: f64,
 }
 
-/// Lit un fichier FITS (image simple, non compressée) via mmap (zéro-copie
-/// pour la partie lecture disque -> mémoire) et calcule min/max/mean en
-/// parallèle avec rayon. Le pool de threads rayon s'adapte automatiquement
-/// au nombre de coeurs disponibles sur la machine (pas de valeur en dur).
+/// Reads a FITS file (simple, uncompressed image) through mmap (zero-copy
+/// for the disk -> memory part) and computes min/max/mean in parallel with
+/// rayon. The rayon thread pool sizes itself to the number of cores
+/// available on the machine (no hardcoded value).
 #[pyfunction]
 fn fits_stats(path: &str) -> PyResult<FitsStats> {
     let start = std::time::Instant::now();
 
     let file = File::open(path)
-        .map_err(|e| PyValueError::new_err(format!("impossible d'ouvrir {path}: {e}")))?;
+        .map_err(|e| PyValueError::new_err(format!("cannot open {path}: {e}")))?;
     let mmap = unsafe {
-        Mmap::map(&file).map_err(|e| PyValueError::new_err(format!("mmap échoué: {e}")))?
+        Mmap::map(&file).map_err(|e| PyValueError::new_err(format!("mmap failed: {e}")))?
     };
 
     let header = parse_header(&mmap)?;
@@ -170,14 +170,14 @@ fn fits_stats(path: &str) -> PyResult<FitsStats> {
 
     if data_end > mmap.len() {
         return Err(PyValueError::new_err(
-            "fichier tronqué : moins de pixels que ce que l'en-tête annonce",
+            "truncated file: fewer pixels than the header announces",
         ));
     }
     let data = &mmap[header.data_offset..data_end];
 
-    // Lecture + conversion en f64 "physique" (BZERO + BSCALE*valeur_brute),
-    // en parallèle sur des chunks de pixels. rayon dimensionne lui-même le
-    // nombre de threads au nombre de coeurs logiques de la machine.
+    // Read + convert to "physical" f64 (BZERO + BSCALE * raw_value), in
+    // parallel over chunks of pixels. rayon sizes the number of threads
+    // itself from the machine's logical core count.
     let (min, max, sum) = match header.bitpix {
         16 => reduce_be::<i16>(data, header.bzero, header.bscale),
         8 => reduce_be::<u8>(data, header.bzero, header.bscale),
@@ -186,7 +186,7 @@ fn fits_stats(path: &str) -> PyResult<FitsStats> {
         -64 => reduce_be::<f64>(data, header.bzero, header.bscale),
         other => {
             return Err(PyValueError::new_err(format!(
-                "BITPIX {other} non supporté pour l'instant"
+                "BITPIX {other} is not supported yet"
             )))
         }
     };
@@ -206,7 +206,7 @@ fn fits_stats(path: &str) -> PyResult<FitsStats> {
     })
 }
 
-/// Trait minimal pour convertir un échantillon big-endian brut en f64.
+/// Minimal trait to convert a raw big-endian sample into f64.
 trait BigEndianSample: Copy {
     const SIZE: usize;
     fn from_be_slice(b: &[u8]) -> f64;
@@ -243,17 +243,16 @@ impl BigEndianSample for f64 {
     }
 }
 
-/// Réduction parallèle (min, max, somme) sur les pixels bruts d'un type T,
-/// en appliquant BZERO/BSCALE pour obtenir la valeur physique.
+/// Parallel reduction (min, max, sum) over the raw pixels of type T,
+/// applying BZERO/BSCALE to get the physical value.
 ///
-/// v2 : au lieu de confier à rayon un itérateur pixel par pixel (overhead de
-/// scheduling/fold par élément), on découpe les données en gros blocs
-/// (`par_chunks`) traités chacun par une boucle séquentielle serrée — ce
-/// style de boucle est ce que LLVM auto-vectorise le mieux (SIMD implicite,
-/// sans intrinsics explicites ni nightly), tout en gardant le parallélisme
-/// entre blocs via rayon.
+/// v2: instead of handing rayon a per-pixel iterator (per-element
+/// scheduling/fold overhead), the data is split into large blocks
+/// (`par_chunks`), each processed by a tight sequential loop -- the loop
+/// style LLVM auto-vectorizes best (implicit SIMD, no explicit intrinsics,
+/// no nightly) -- while keeping parallelism across blocks via rayon.
 fn reduce_be<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) -> (f64, f64, f64) {
-    const CHUNK_PIXELS: usize = 1 << 16; // 65536 pixels par bloc rayon
+    const CHUNK_PIXELS: usize = 1 << 16; // 65536 pixels per rayon block
     let chunk_bytes = CHUNK_PIXELS * T::SIZE;
 
     data.par_chunks(chunk_bytes.max(T::SIZE))
@@ -281,12 +280,12 @@ fn reduce_be<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) ->
         )
 }
 
-/// Convertit des coordonnées célestes (RA/Dec, en degrés) en coordonnées
-/// pixel (convention FITS 1-indexée), via projection tangentielle (TAN /
-/// gnomonique) standard — la projection utilisée par la quasi-totalité des
-/// relevés modernes (dont Euclid) pour les images à champ pas trop large.
-/// Ne gère pas de distorsion SIP (termes d'ordre supérieur) : suffisant
-/// pour une première version, à affiner si les vraies images Euclid en ont.
+/// Converts sky coordinates (RA/Dec, in degrees) to pixel coordinates (FITS
+/// 1-indexed convention) using the standard tangent (TAN / gnomonic)
+/// projection -- the projection used by almost all modern surveys
+/// (Euclid included) for images that are not too wide-field.
+/// SIP distortion (higher-order terms) is not handled: fine for a first
+/// version, to be refined if real Euclid images need it.
 fn radec_to_pixel(ra_deg: f64, dec_deg: f64, wcs: &Wcs) -> (f64, f64) {
     let ra = ra_deg.to_radians();
     let dec = dec_deg.to_radians();
@@ -300,8 +299,8 @@ fn radec_to_pixel(ra_deg: f64, dec_deg: f64, wcs: &Wcs) -> (f64, f64) {
     let xi_deg = xi.to_degrees();
     let eta_deg = eta.to_degrees();
 
-    // Inversion de la matrice CD 2x2 pour passer des coordonnées monde
-    // intermédiaires (xi, eta) aux décalages en pixels.
+    // Invert the 2x2 CD matrix to go from intermediate world coordinates
+    // (xi, eta) to pixel offsets.
     let det = wcs.cd1_1 * wcs.cd2_2 - wcs.cd1_2 * wcs.cd2_1;
     let dx = (wcs.cd2_2 * xi_deg - wcs.cd1_2 * eta_deg) / det;
     let dy = (-wcs.cd2_1 * xi_deg + wcs.cd1_1 * eta_deg) / det;
@@ -309,8 +308,8 @@ fn radec_to_pixel(ra_deg: f64, dec_deg: f64, wcs: &Wcs) -> (f64, f64) {
     (wcs.crpix1 + dx, wcs.crpix2 + dy)
 }
 
-/// Résultat d'une extraction de cutout : la sous-image (valeurs physiques,
-/// ligne par ligne) + le contexte (où elle a été prise, combien de temps).
+/// Result of a cutout extraction: the sub-image (physical values, row by
+/// row) plus context (where it was taken, how long it took).
 #[pyclass]
 struct Cutout {
     #[pyo3(get)]
@@ -322,14 +321,14 @@ struct Cutout {
     #[pyo3(get)]
     pixel_y_center: f64,
     #[pyo3(get)]
-    data: Vec<f64>, // row-major, longueur = width*height
+    data: Vec<f64>, // row-major, length = width * height
     #[pyo3(get)]
     elapsed_ms: f64,
 }
 
-/// Coeur partagé de l'extraction de cutout (sans la mesure de temps ni le
-/// habillage PyO3), réutilisé par `extract_cutout` et `export_cutout_parquet`.
-/// Retourne (pixel_x_centre, pixel_y_centre, x0, y0, data row-major).
+/// Shared core of the cutout extraction (without timing or the PyO3
+/// wrapping), reused by `extract_cutout` and `export_cutout_parquet`.
+/// Returns (pixel_x_center, pixel_y_center, x0, y0, row-major data).
 fn extract_cutout_raw(
     path: &str,
     ra_deg: f64,
@@ -338,17 +337,17 @@ fn extract_cutout_raw(
     height: usize,
 ) -> PyResult<(f64, f64, usize, usize, Vec<f64>)> {
     let file = File::open(path)
-        .map_err(|e| PyValueError::new_err(format!("impossible d'ouvrir {path}: {e}")))?;
+        .map_err(|e| PyValueError::new_err(format!("cannot open {path}: {e}")))?;
     let mmap = unsafe {
-        Mmap::map(&file).map_err(|e| PyValueError::new_err(format!("mmap échoué: {e}")))?
+        Mmap::map(&file).map_err(|e| PyValueError::new_err(format!("mmap failed: {e}")))?
     };
     let header = parse_header(&mmap)?;
     let wcs = header
         .wcs
-        .ok_or_else(|| PyValueError::new_err("ce fichier n'a pas d'en-tête WCS (CRVAL/CRPIX/CD)"))?;
+        .ok_or_else(|| PyValueError::new_err("this file has no WCS header (CRVAL/CRPIX/CD)"))?;
 
     let (px, py) = radec_to_pixel(ra_deg, dec_deg, &wcs);
-    // Conversion 1-indexé FITS -> 0-indexé tableau, puis coin haut-gauche du cutout.
+    // Convert FITS 1-indexed -> 0-indexed array, then take the cutout's top-left corner.
     let cx = px - 1.0;
     let cy = py - 1.0;
     let x0 = (cx - width as f64 / 2.0).round() as i64;
@@ -360,7 +359,7 @@ fn extract_cutout_raw(
         || y0 as usize + height > header.naxis2
     {
         return Err(PyValueError::new_err(format!(
-            "cutout hors image : pixel central=({px:.1},{py:.1}), image={}x{}",
+            "cutout outside the image: center pixel=({px:.1},{py:.1}), image={}x{}",
             header.naxis1, header.naxis2
         )));
     }
@@ -382,7 +381,7 @@ fn extract_cutout_raw(
                 32 => i32::from_be_slice(raw),
                 -32 => f32::from_be_slice(raw),
                 -64 => f64::from_be_slice(raw),
-                other => return Err(PyValueError::new_err(format!("BITPIX {other} non supporté"))),
+                other => return Err(PyValueError::new_err(format!("BITPIX {other} is not supported"))),
             };
             data.push(header.bzero + header.bscale * v);
         }
@@ -391,11 +390,11 @@ fn extract_cutout_raw(
     Ok((px, py, x0, y0, data))
 }
 
-/// Extrait un cutout (petit carré) autour de coordonnées célestes (RA/Dec en
-/// degrés), sans lire le fichier entier : via mmap, on ne touche que les
-/// quelques lignes nécessaires — l'OS ne charge en RAM que les pages
-/// mémoire correspondant aux octets réellement lus (c'est le gain promis
-/// par le projet : pas besoin de lire 1 Go pour extraire une vignette).
+/// Extracts a cutout (small rectangle) around sky coordinates (RA/Dec in
+/// degrees) without reading the whole file: through mmap only the few
+/// rows needed are touched -- the OS only loads into RAM the memory pages
+/// that correspond to the bytes actually read (that is the project's whole
+/// point: no need to read 1 GB to extract a thumbnail).
 #[pyfunction]
 fn extract_cutout(path: &str, ra_deg: f64, dec_deg: f64, width: usize, height: usize) -> PyResult<Cutout> {
     let start = std::time::Instant::now();
@@ -410,7 +409,7 @@ fn extract_cutout(path: &str, ra_deg: f64, dec_deg: f64, width: usize, height: u
     })
 }
 
-/// Résultat d'un export Parquet.
+/// Result of a Parquet export.
 #[pyclass]
 struct ParquetExport {
     #[pyo3(get)]
@@ -421,11 +420,11 @@ struct ParquetExport {
     elapsed_ms: f64,
 }
 
-/// Extrait un cutout ET l'exporte directement en Parquet (format colonnaire
-/// moderne, lu instantanément par pandas/polars/DuckDB) : une ligne par
-/// pixel, colonnes (x, y, value), x/y étant les coordonnées pixel absolues
-/// dans l'image source (pas juste dans le cutout), pour pouvoir recoller
-/// plusieurs cutouts ensemble si besoin.
+/// Extracts a cutout AND exports it directly as Parquet (modern columnar
+/// format, read instantly by pandas/polars/DuckDB): one row per pixel,
+/// columns (x, y, value), where x/y are the absolute pixel coordinates in
+/// the source image (not just within the cutout), so that several cutouts
+/// can be stitched back together if needed.
 #[pyfunction]
 fn export_cutout_parquet(
     path: &str,
@@ -453,18 +452,18 @@ fn export_cutout_parquet(
     let v_arr: arrow_array::ArrayRef = std::sync::Arc::new(arrow_array::Float64Array::from(data));
 
     let batch = arrow_array::RecordBatch::try_from_iter([("x", x_arr), ("y", y_arr), ("value", v_arr)])
-        .map_err(|e| PyValueError::new_err(format!("construction du RecordBatch échouée: {e}")))?;
+        .map_err(|e| PyValueError::new_err(format!("failed to build the RecordBatch: {e}")))?;
 
     let out_file = File::create(out_path)
-        .map_err(|e| PyValueError::new_err(format!("création de {out_path} échouée: {e}")))?;
+        .map_err(|e| PyValueError::new_err(format!("failed to create {out_path}: {e}")))?;
     let mut writer = parquet::arrow::arrow_writer::ArrowWriter::try_new(out_file, batch.schema(), None)
-        .map_err(|e| PyValueError::new_err(format!("init ArrowWriter échouée: {e}")))?;
+        .map_err(|e| PyValueError::new_err(format!("failed to initialise the ArrowWriter: {e}")))?;
     writer
         .write(&batch)
-        .map_err(|e| PyValueError::new_err(format!("écriture Parquet échouée: {e}")))?;
+        .map_err(|e| PyValueError::new_err(format!("Parquet write failed: {e}")))?;
     writer
         .close()
-        .map_err(|e| PyValueError::new_err(format!("fermeture Parquet échouée: {e}")))?;
+        .map_err(|e| PyValueError::new_err(format!("Parquet close failed: {e}")))?;
 
     Ok(ParquetExport {
         out_path: out_path.to_string(),
@@ -473,14 +472,14 @@ fn export_cutout_parquet(
     })
 }
 
-/// Nombre de coeurs logiques détectés sur la machine (pour vérifier que
-/// l'adaptation matérielle fonctionne bien, sans rien coder en dur).
+/// Number of logical cores detected on the machine (to check that the
+/// hardware adaptation works, with nothing hardcoded).
 #[pyfunction]
 fn detected_cpus() -> usize {
     num_cpus::get()
 }
 
-/// Module Python exposé.
+/// The Python module exposed to users (`import euclid_fast`).
 #[pymodule]
 fn euclid_fast(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fits_stats, m)?)?;

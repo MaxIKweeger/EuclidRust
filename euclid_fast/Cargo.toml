@@ -17,9 +17,9 @@ num_cpus = "1"
 parquet = { version = "60", features = ["arrow"] }
 arrow-array = "60"
 
-# Perf max : LTO complet, un seul codegen-unit (meilleure optimisation croisée,
-# compile plus lentement mais le binaire final est plus rapide), panic=abort
-# pas utilisé ici car PyO3 a besoin de pouvoir remonter des exceptions Python.
+# Max performance: full LTO and a single codegen unit (better cross-function
+# optimisation; slower to compile, faster binary). `panic = "abort"` is not
+# used here because PyO3 needs to be able to surface Python exceptions.
 [profile.release]
 lto = "fat"
 codegen-units = 1

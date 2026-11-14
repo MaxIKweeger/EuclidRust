@@ -1,0 +1,5 @@
+# Only needed for scripts/benchmark_vs_astropy_real.py
+# (euclid_fast itself has no Python dependencies; download_real_data.py uses
+# only the standard library.)
+numpy
+astropy

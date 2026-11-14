@@ -1,9 +1,8 @@
-# Environnement Python (recréé via: python3 -m venv .venv && pip install maturin)
+# Python virtual environment (recreate with: python3 -m venv .venv && pip install maturin)
 .venv/
 
-# Données volumineuses : ne jamais pousser des FITS/Parquet de plusieurs
-# centaines de Mo à quelques Go dans git. Les scripts de scripts/ savent
-# les régénérer (make_orion_1gb.py) ou les retélécharger (voir README).
+# Large data: never push multi-hundred-MB / multi-GB FITS or Parquet files
+# to git. Fetch real Euclid tiles with scripts/download_real_data.py.
 data/*.fits
 data/*.parquet
 data/real/
@@ -11,7 +10,7 @@ data/real/
 __pycache__/
 *.pyc
 
-# Build Rust (déjà couvert dans euclid_fast/.gitignore, redondance ok)
+# Rust build output (also covered by euclid_fast/.gitignore, redundancy is fine)
 euclid_fast/target/
 
 # Personal notes, not part of the public repo
