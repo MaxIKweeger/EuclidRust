@@ -78,6 +78,38 @@ def test_int64(tmp):
     assert s.bitpix == 64
 
 
+def test_int64_exact(tmp):
+    # 64-bit integers are handled exactly, not through float64.
+    # 1. signed values above 2**53, where float64 loses the last bits
+    ids = np.array([[2**53 + 1, 2**53 + 3, 5], [7, 2**60 + 1, 9]], dtype=np.int64)
+    s = euclid_fast.fits_stats(write(tmp, "signed.fits", fits.HDUList([fits.PrimaryHDU(ids)])))
+    assert (s.min_int, s.max_int) == (5, 2**60 + 1)
+    assert float(2**60 + 1) == s.max                        # the float field is the nearest double
+    # 2. unsigned 64-bit (stored as BITPIX 64 with BZERO = 2**63): wrong in the
+    #    low bits for every value when BZERO was added in floating point
+    u = np.array([[1, 2, 3], [4, 100000000000000, 2**64 - 1]], dtype=np.uint64)
+    hu = fits.PrimaryHDU(u)
+    assert hu.header["BITPIX"] == 64 and hu.header["BZERO"] == 2**63
+    s = euclid_fast.fits_stats(write(tmp, "unsigned.fits", fits.HDUList([hu])))
+    assert (s.min_int, s.max_int) == (1, 2**64 - 1)
+    assert abs(s.mean - float(u.astype(object).sum()) / 6) <= 1e-9 * s.mean
+    # 3. cutouts carry the exact integers in data_int
+    lab = (np.arange(200 * 300, dtype=np.uint64).reshape(200, 300) + np.uint64(2**62) + np.uint64(1))
+    hl = fits.PrimaryHDU(lab); add_wcs(hl.header)
+    p = write(tmp, "labels.fits", fits.HDUList([hl]))
+    c = euclid_fast.extract_cutout(p, RA, DEC, 6, 4)
+    x0, y0 = int(round(c.pixel_x_center - 1 - 3)), int(round(c.pixel_y_center - 1 - 2))
+    truth = [int(v) for v in lab[y0:y0 + 4, x0:x0 + 6].ravel()]
+    assert c.data_int == truth
+    assert sum(int(f) != i for f, i in zip(c.data, truth)) > 0           # float64 alone could not hold them
+    many = euclid_fast.extract_cutouts(p, [RA, RA], [DEC, DEC], 6, 4)
+    assert all(m.data_int == truth for m in many)
+    # 4. other pixel types have no exact-integer fields
+    h2 = fits.PrimaryHDU(IMG); add_wcs(h2.header)
+    p2 = write(tmp, "float.fits", fits.HDUList([h2]))
+    assert euclid_fast.fits_stats(p2).min_int is None and cutout(p2).data_int is None
+
+
 def test_extensions(tmp):
     # Layout of Euclid calibrated frames: empty primary, one image per extension.
     sci = fits.ImageHDU(IMG, name="DET11.SCI"); add_wcs(sci.header)
@@ -412,7 +444,7 @@ def test_batch(tmp):
 
 def test_all():
     for fn in (test_supported_primary, test_int64, test_extensions, test_unreadable_hdus,
-               test_rejected_inputs, test_tpv_matches_astropy, test_wcs_matches_astropy,
+               test_int64_exact, test_rejected_inputs, test_tpv_matches_astropy, test_wcs_matches_astropy,
                test_compressed_images, test_batch):
         with tempfile.TemporaryDirectory() as tmp:
             fn(tmp)

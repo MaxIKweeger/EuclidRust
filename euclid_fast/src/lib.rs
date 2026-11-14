@@ -1245,6 +1245,10 @@ struct FitsStats {
     #[pyo3(get)]
     mean: f64,
     #[pyo3(get)]
+    min_int: Option<i128>, // exact min / max for 64-bit integer images, else None
+    #[pyo3(get)]
+    max_int: Option<i128>,
+    #[pyo3(get)]
     threads_used: usize,
     #[pyo3(get)]
     elapsed_ms: f64,
@@ -1276,6 +1280,7 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
     let header = locate_image(&mmap, hdu)?;
     let n_pixels = header.naxis1 * header.naxis2;
 
+    let mut exact: Option<(i128, i128)> = None;
     let (min, max, sum) = if let Some(t) = &header.tiled {
         let parts: Vec<(f64, f64, f64)> = (0..t.nrows)
             .into_par_iter()
@@ -1297,7 +1302,16 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
             16 => reduce_be::<i16>(data, header.bzero, header.bscale),
             8 => reduce_be::<u8>(data, header.bzero, header.bscale),
             32 => reduce_be::<i32>(data, header.bzero, header.bscale),
-            64 => reduce_be::<i64>(data, header.bzero, header.bscale),
+            64 => match int64_offset(header.bzero, header.bscale) {
+                // Exact integer arithmetic: BZERO is added as an integer, so unsigned
+                // 64-bit data (BZERO = 2^63) and values above 2^53 stay exact.
+                Some(offset) => {
+                    let (mn, mx, sm) = reduce_i64_exact(data, offset);
+                    exact = Some((mn, mx));
+                    (mn as f64, mx as f64, sm as f64)
+                }
+                None => reduce_be::<i64>(data, header.bzero, header.bscale),
+            },
             -32 => reduce_be::<f32>(data, header.bzero, header.bscale),
             -64 => reduce_be::<f64>(data, header.bzero, header.bscale),
             other => return err(format!("BITPIX {other} is not supported yet")),
@@ -1314,6 +1328,8 @@ fn stats_impl(path: &str, hdu: &Option<HduSelector>) -> PyResult<FitsStats> {
         min,
         max,
         mean,
+        min_int: exact.map(|e| e.0),
+        max_int: exact.map(|e| e.1),
         threads_used: rayon::current_num_threads(),
         elapsed_ms,
     })
@@ -1519,6 +1535,38 @@ fn reduce_be<T: BigEndianSample + Sync>(data: &[u8], bzero: f64, bscale: f64) ->
             || (f64::INFINITY, f64::NEG_INFINITY, 0.0_f64),
             |(mn1, mx1, s1), (mn2, mx2, s2)| (mn1.min(mn2), mx1.max(mx2), s1 + s2),
         )
+}
+
+/// The integer value of BZERO if the physical value of a 64-bit integer pixel is
+/// simply `raw + BZERO` (BSCALE = 1, BZERO a whole number): then everything can
+/// be computed exactly in integers. This covers signed 64-bit images (BZERO = 0)
+/// and unsigned ones, which FITS stores as signed with BZERO = 2^63.
+fn int64_offset(bzero: f64, bscale: f64) -> Option<i128> {
+    if bscale == 1.0 && bzero.fract() == 0.0 && bzero.abs() < 1e30 {
+        Some(bzero as i128)
+    } else {
+        None
+    }
+}
+
+/// Exact (min, max, sum) of the physical values (raw + offset) of big-endian
+/// 64-bit integers, in 128-bit integer arithmetic, in parallel.
+fn reduce_i64_exact(data: &[u8], offset: i128) -> (i128, i128, i128) {
+    let n = (data.len() / 8) as i128;
+    let (mn, mx, sum) = data
+        .par_chunks(8 << 16)
+        .map(|chunk| {
+            let (mut mn, mut mx, mut sum) = (i64::MAX, i64::MIN, 0i128);
+            for b in chunk.chunks_exact(8) {
+                let v = i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                mn = mn.min(v);
+                mx = mx.max(v);
+                sum += v as i128;
+            }
+            (mn as i128, mx as i128, sum)
+        })
+        .reduce(|| (i128::MAX, i128::MIN, 0i128), |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 + b.2));
+    (mn + offset, mx + offset, sum + offset * n)
 }
 
 /// The (powers of x, powers of y, powers of r) of each of the 40 TPV terms,
@@ -1779,6 +1827,8 @@ struct Cutout {
     #[pyo3(get)]
     data: Vec<f64>, // row-major, length = width * height
     #[pyo3(get)]
+    data_int: Option<Vec<i128>>, // exact values for 64-bit integer images, else None
+    #[pyo3(get)]
     elapsed_ms: f64,
 }
 
@@ -1792,7 +1842,7 @@ fn extract_cutout_raw(
     width: usize,
     height: usize,
     hdu: &Option<HduSelector>,
-) -> PyResult<(f64, f64, usize, usize, Vec<f64>)> {
+) -> PyResult<(f64, f64, usize, usize, Vec<f64>, Option<Vec<i128>>)> {
     let mmap = open_mmap(path)?;
     let header = locate_image(&mmap, hdu)?;
     cutout_at(&mmap, &header, ra_deg, dec_deg, width, height)
@@ -1806,7 +1856,7 @@ fn cutout_at(
     dec_deg: f64,
     width: usize,
     height: usize,
-) -> PyResult<(f64, f64, usize, usize, Vec<f64>)> {
+) -> PyResult<(f64, f64, usize, usize, Vec<f64>, Option<Vec<i128>>)> {
     if let Some(msg) = &header.wcs_error {
         return err(msg.clone());
     }
@@ -1863,7 +1913,7 @@ fn cutout_at(
                 }
             }
         }
-        return Ok((px, py, x0, y0, data));
+        return Ok((px, py, x0, y0, data, None));
     }
 
     let bytes_per_pixel = (header.bitpix.unsigned_abs() as usize) / 8;
@@ -1874,12 +1924,21 @@ fn cutout_at(
     }
 
     let mut data = Vec::with_capacity(width * height);
+    // 64-bit integers are read exactly (BZERO = 2^63 is how FITS stores uint64).
+    let exact_offset = if header.bitpix == 64 { int64_offset(header.bzero, header.bscale) } else { None };
+    let mut data_int: Option<Vec<i128>> = exact_offset.map(|_| Vec::with_capacity(width * height));
     for row in 0..height {
         let row_offset = header.data_offset + (y0 + row) * row_stride + x0 * bytes_per_pixel;
         let row_bytes = &mmap[row_offset..row_offset + width * bytes_per_pixel];
         for col in 0..width {
             let off = col * bytes_per_pixel;
             let raw = &row_bytes[off..off + bytes_per_pixel];
+            if let (Some(offset), Some(ints)) = (exact_offset, data_int.as_mut()) {
+                let value = i64::from_be_bytes([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]]) as i128 + offset;
+                ints.push(value);
+                data.push(value as f64);
+                continue;
+            }
             let v = match header.bitpix {
                 16 => i16::from_be_slice(raw),
                 8 => u8::from_be_slice(raw),
@@ -1893,7 +1952,7 @@ fn cutout_at(
         }
     }
 
-    Ok((px, py, x0, y0, data))
+    Ok((px, py, x0, y0, data, data_int))
 }
 
 /// Extracts a cutout (small rectangle) around sky coordinates (RA/Dec in
@@ -1916,7 +1975,7 @@ fn extract_cutout(
     hdu: Option<HduSelector>,
 ) -> PyResult<Cutout> {
     let start = std::time::Instant::now();
-    let (px, py, _x0, _y0, data) =
+    let (px, py, _x0, _y0, data, data_int) =
         python.detach(|| extract_cutout_raw(path, ra_deg, dec_deg, width, height, &hdu))?;
     Ok(Cutout {
         width,
@@ -1924,6 +1983,7 @@ fn extract_cutout(
         pixel_x_center: px,
         pixel_y_center: py,
         data,
+        data_int,
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
     })
 }
@@ -1960,12 +2020,13 @@ fn extract_cutouts(
             .zip(dec_deg.par_iter())
             .map(|(&ra, &dec)| {
                 let start = std::time::Instant::now();
-                cutout_at(&mmap, &header, ra, dec, width, height).map(|(px, py, _x0, _y0, data)| Cutout {
+                cutout_at(&mmap, &header, ra, dec, width, height).map(|(px, py, _x0, _y0, data, data_int)| Cutout {
                     width,
                     height,
                     pixel_x_center: px,
                     pixel_y_center: py,
                     data,
+                    data_int,
                     elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                 })
             })
@@ -2016,7 +2077,7 @@ fn export_cutout_parquet(
     hdu: Option<HduSelector>,
 ) -> PyResult<ParquetExport> {
     let start = std::time::Instant::now();
-    let (_px, _py, x0, y0, data) =
+    let (_px, _py, x0, y0, data, _) =
         python.detach(|| extract_cutout_raw(path, ra_deg, dec_deg, width, height, &hdu))?;
 
     let n = data.len();

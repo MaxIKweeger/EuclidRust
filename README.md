@@ -60,7 +60,7 @@ contains.
 |---|---|
 | An image HDU | 2-D (`NAXIS = 2`). The primary HDU by default, or any image extension through `hdu=` (0-based index or `EXTNAME`) |
 | Compression | None, or FITS tile compression with `RICE_1`, `GZIP_1` or `GZIP_2` (the `.fits.fz` format written by `fpack` and by astropy's `CompImageHDU`), including quantized floating-point images (`NO_DITHER`, `SUBTRACTIVE_DITHER_1`, `SUBTRACTIVE_DITHER_2`). A compressed image always lives in an extension, so pass `hdu=1` (or its name) |
-| Pixel type (`BITPIX`) | `8`, `16`, `32`, `64` (integers), `-32`, `-64` (floating point). `BZERO` / `BSCALE` are applied, so unsigned 16-bit raw data (`BZERO = 32768`) works. 64-bit integers are converted to `float64`, which is exact up to 2^53 (about 9 × 10^15) |
+| Pixel type (`BITPIX`) | `8`, `16`, `32`, `64` (integers), `-32`, `-64` (floating point). `BZERO` / `BSCALE` are applied, so unsigned 16-bit raw data (`BZERO = 32768`) works. 64-bit integers, signed or unsigned (FITS stores unsigned 64-bit as signed with `BZERO = 2^63`), are handled **exactly**: the exact values are in `min_int` / `max_int` (`fits_stats`) and `data_int` (`extract_cutout`), as Python ints; the ordinary float fields hold the nearest `float64` |
 | WCS, only needed for cutouts | `CTYPE1/2` = `RA---xxx` / `DEC--xxx` with `xxx` one of `TAN`, `SIN`, `ARC`, `STG`, `ZEA`, `ZPN` (the zenithal projections), `TAN-SIP` (tangent plus the SIP polynomial distortion) or `TPV` (tangent plus the `PV1_m` / `PV2_m` polynomials used by the Euclid VIS pipeline), together with `CRVAL1/2`, `CRPIX1/2` and a linear matrix written as `CD` (`CD1_1`, `CD1_2`, `CD2_1`, `CD2_2`), as `CDELT1/2` with an optional `PC` matrix, or as `CDELT1/2` with the legacy `CROTA2`. `LONPOLE` is honoured. `fits_stats` needs no WCS |
 
 **Not supported.** Anything else is rejected with a `ValueError` that says
@@ -92,7 +92,7 @@ them, comparing with astropy:
 | VIS calibrated frames (`EUC_VIS_SWL-BKG...`) | extensions `1-1.E`... (`TPV` WCS) | **Works** with `hdu="1-1.E"` etc. Checked on one detector: stats identical to astropy; over 300 random sky positions the cutout center agrees with astropy/wcslib to 3 × 10^-8 pixel, and all cutout pixels are identical |
 | RAW frames, NISP (`EUC_LE1_NISP...`) | extensions `DETnn.SCI` (unsigned 16-bit via `BZERO`) | **Stats work** (checked on one detector). Cutouts are refused: the WCS is in detector-mosaic coordinates (`Y_MOSA`), not sky coordinates |
 | RAW frames, VIS (`EUC_LE1_VIS...`) | extensions `1-1.E`... | Same layout as the other frames, **not run** |
-| MER segmentation maps (`EUC_MER_FINAL-SEGMAP...`) | primary HDU, `BITPIX = 64` | **Stats work** (checked on the real 2.9 GB file: min, max and mean identical to astropy to ~13 digits). No `CD` matrix in the header, so no cutouts |
+| MER segmentation maps (`EUC_MER_FINAL-SEGMAP...`) | primary HDU, `BITPIX = 64` | **Stats work** (checked on the real 2.9 GB file: min and max identical to astropy, exact in `min_int` / `max_int`, mean agreeing to ~13 digits). No `CD` matrix in the header, so no cutouts |
 | Catalogues, PSF files, other tables | table extensions | Not images, out of scope |
 
 None of the Q1 image files I looked at were tile-compressed, so there was no compressed Euclid file to test on. Compressed-image support was validated on copies of real Euclid data that I compressed with astropy/cfitsio (see [Compressed images](#compressed-images)).
@@ -292,8 +292,8 @@ Reference:
 
 | Function | Returns | Fields |
 |---|---|---|
-| `fits_stats(path, hdu=None)` | `FitsStats` | `min`, `max`, `mean`, `naxis1`, `naxis2`, `bitpix`, `threads_used`, `elapsed_ms` |
-| `extract_cutout(path, ra_deg, dec_deg, width, height, hdu=None)` | `Cutout` | `data` (flat list of floats, row-major), `width`, `height`, `pixel_x_center`, `pixel_y_center`, `elapsed_ms` |
+| `fits_stats(path, hdu=None)` | `FitsStats` | `min`, `max`, `mean`, `naxis1`, `naxis2`, `bitpix`, `threads_used`, `elapsed_ms`, and `min_int`, `max_int` (exact integers for 64-bit integer images, otherwise `None`) |
+| `extract_cutout(path, ra_deg, dec_deg, width, height, hdu=None)` | `Cutout` | `data` (flat list of floats, row-major), `data_int` (the same pixels as exact Python ints for 64-bit integer images, otherwise `None`), `width`, `height`, `pixel_x_center`, `pixel_y_center`, `elapsed_ms` |
 | `export_cutout_parquet(path, ra_deg, dec_deg, width, height, out_path, hdu=None)` | `ParquetExport` | `out_path`, `rows`, `elapsed_ms` |
 | `fits_stats_many(paths, hdu=None, skip_errors=False)` | list of `FitsStats` (or `None`) | one per file, in the same order; see [Many images at once](#many-images-at-once) |
 | `fits_stats_all_hdus(path, name_contains=None)` | list of `HduStats` | per image HDU: `index`, `name`, `naxis1`, `naxis2`, `bitpix`, `min`, `max`, `mean`, `elapsed_ms` |
@@ -371,7 +371,7 @@ parallel, not from batching.
 
 `tests/test_input_validation.py` builds small FITS files with astropy and
 checks that supported files work (primary HDU, extensions, `BITPIX` 16 and
-64, `BZERO`/`BSCALE`), that unsupported ones are rejected with a clear error,
+64 including exact unsigned 64-bit values, `BZERO`/`BSCALE`), that unsupported ones are rejected with a clear error,
 that every supported projection, matrix form, the TPV distortion and the SIP
 distortion (including real SIP headers from astropy's own test data) agree with
 astropy/wcslib, and that tile-compressed images (`RICE_1`, `GZIP_1`,
@@ -635,8 +635,7 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
   frame, one raw NISP detector and one segmentation map. That is enough to
   show the approach works on real archival products, not a representative
   sample across instruments, bands and tiles.
-- **64-bit integers are converted to `float64`**, which is exact up to 2^53
-  (about 9 × 10^15). Larger values would lose precision.
+- **Exact 64-bit integers, for raw images.** Signed and unsigned 64-bit images are exact in `min_int` / `max_int` and `data_int`. Everything else derived from them (`min`, `max`, `mean`, `data`, the Parquet `value` column) is `float64`, exact only up to 2^53 (about 9 × 10^15). The exact path needs `BSCALE = 1` and a whole-number `BZERO`; 64-bit integer images inside tile-compressed files are converted to `float64` throughout.
 - **Tested on one platform.** Linux (Debian 13, x86_64) only so far.
 
 ## Roadmap
