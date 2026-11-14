@@ -15,10 +15,18 @@ Usage (see the README for the full walkthrough):
 
     python scripts/benchmark_vs_astropy_real.py path/to/image.fits
 
-The FITS file must be an uncompressed single-HDU image with a standard
-RA---TAN / DEC--TAN WCS (for example a Euclid MER mosaic tile). By default
-the cutout is centered on the image center (CRVAL1/CRVAL2 from the FITS
-header), so any such file works without choosing coordinates.
+The FITS file must contain an uncompressed 2-D image with a standard
+RA---TAN / DEC--TAN (or RA---TPV / DEC--TPV) WCS. For a Euclid MER mosaic
+tile the image is in the primary HDU. For calibrated frames (VIS, NISP) the
+images live in extensions: choose one with --hdu (an EXTNAME or a 0-based
+index), for example:
+
+    python scripts/benchmark_vs_astropy_real.py frame.fits --hdu DET11.SCI
+
+By default the cutout is centered on the sky position of the image center,
+computed from the file's own WCS, so any such file works without choosing
+coordinates. If the file has no sky WCS (for example raw detector frames),
+only the global-stats comparison is run.
 """
 import argparse
 import os
@@ -48,10 +56,12 @@ except ImportError:
 def parse_args():
     p = argparse.ArgumentParser(description="Benchmark euclid_fast against astropy on a FITS image.")
     p.add_argument("file", type=Path, help="path to the FITS image to benchmark")
+    p.add_argument("--hdu", type=lambda s: int(s) if s.isdigit() else s, default=None,
+                   help="HDU holding the image: an EXTNAME or a 0-based index (default: the primary HDU)")
     p.add_argument("--ra", type=float, default=None,
-                   help="cutout center RA in degrees (default: CRVAL1 of the file)")
+                   help="cutout center RA in degrees (default: the image center)")
     p.add_argument("--dec", type=float, default=None,
-                   help="cutout center Dec in degrees (default: CRVAL2 of the file)")
+                   help="cutout center Dec in degrees (default: the image center)")
     p.add_argument("--size", type=int, default=50, help="cutout width and height in pixels (default: 50)")
     p.add_argument("--runs", type=int, default=5, help="repetitions per measurement (default: 5)")
     return p.parse_args()
@@ -82,25 +92,36 @@ def main():
     if not args.file.exists():
         sys.exit(f"File not found: {args.file}")
 
+    hdu = args.hdu
+    hdu_idx = 0 if hdu is None else hdu          # astropy HDU selector
     with fits.open(path, memmap=True) as hdul:
-        header = hdul[0].header
-        ra = args.ra if args.ra is not None else float(header["CRVAL1"])
-        dec = args.dec if args.dec is not None else float(header["CRVAL2"])
+        header = hdul[hdu_idx].header
+        # astropy cannot memory-map images that need BZERO/BSCALE/BLANK scaling
+        memmap = not any(k in header for k in ("BZERO", "BSCALE", "BLANK"))
+        # Default cutout center: an integer pixel near the middle of the image,
+        # converted to sky coordinates with the file's own WCS.
+        try:
+            cx, cy = header["NAXIS1"] // 2 + 1, header["NAXIS2"] // 2 + 1      # FITS 1-indexed
+            c_ra, c_dec = WCS(header).all_pix2world(cx, cy, 1)
+            ra = args.ra if args.ra is not None else float(c_ra)
+            dec = args.dec if args.dec is not None else float(c_dec)
+        except Exception:
+            ra, dec = args.ra, args.dec
     size, n_runs = args.size, args.runs
 
     # --- Warm-up: one pass of each method so the file is in the OS cache ---
-    with fits.open(path, memmap=True) as hdul:
-        _ = hdul[0].data.min()
-    _ = euclid_fast.fits_stats(path)
+    with fits.open(path, memmap=memmap) as hdul:
+        _ = hdul[hdu_idx].data.min()
+    _ = euclid_fast.fits_stats(path, hdu=hdu)
 
     # --- 1. Global stats ---
     def astropy_stats():
-        with fits.open(path, memmap=True) as hdul:
-            data = hdul[0].data
+        with fits.open(path, memmap=memmap) as hdul:
+            data = hdul[hdu_idx].data
             return float(data.min()), float(data.max()), float(data.mean())
 
     def rust_stats():
-        s = euclid_fast.fits_stats(path)
+        s = euclid_fast.fits_stats(path, hdu=hdu)
         return s.min, s.max, s.mean
 
     astropy_stats_result = astropy_stats()
@@ -110,28 +131,36 @@ def main():
 
     # --- 2. Cutout by RA/Dec ---
     def astropy_cutout():
-        with fits.open(path, memmap=True) as hdul:
-            wcs = WCS(hdul[0].header)
+        with fits.open(path, memmap=memmap) as hdul:
+            wcs = WCS(hdul[hdu_idx].header)
             x, y = wcs.all_world2pix(ra, dec, 0)  # 0-indexed
             x0 = int(round(float(x))) - size // 2
             y0 = int(round(float(y))) - size // 2
-            cutout = hdul[0].data[y0 : y0 + size, x0 : x0 + size]
+            cutout = hdul[hdu_idx].data[y0 : y0 + size, x0 : x0 + size]
             return np.array(cutout)  # force the actual read
 
     def rust_cutout():
-        return euclid_fast.extract_cutout(path, ra, dec, size, size).data
+        return euclid_fast.extract_cutout(path, ra, dec, size, size, hdu=hdu).data
 
-    astropy_cutout_result = astropy_cutout()
-    rust_cutout_result = rust_cutout()
-    t_astropy_cutout, _ = median_ms(astropy_cutout, n_runs)
-    t_rust_cutout, _ = median_ms(rust_cutout, n_runs)
-
-    same_pixels = np.array_equal(
-        astropy_cutout_result.astype(np.float64).ravel(), np.asarray(rust_cutout_result)
-    )
+    cutout_skipped = None
+    if ra is None or dec is None or not np.isfinite([ra, dec]).all():
+        cutout_skipped = "no usable sky WCS in this HDU (pass --ra and --dec to force a position)"
+    else:
+        try:
+            astropy_cutout_result = astropy_cutout()
+            rust_cutout_result = rust_cutout()
+            t_astropy_cutout, _ = median_ms(astropy_cutout, n_runs)
+            t_rust_cutout, _ = median_ms(rust_cutout, n_runs)
+            same_pixels = np.array_equal(
+                astropy_cutout_result.astype(np.float64).ravel(), np.asarray(rust_cutout_result)
+            )
+        except ValueError as e:        # euclid_fast refused the file/position: say why
+            cutout_skipped = str(e)
 
     print("=" * 70)
     print(f"File: {path}  ({os.path.getsize(path) / 1e9:.2f} GB)")
+    print(f"HDU: {'primary' if hdu is None else repr(hdu)}"
+          + ("" if memmap else "   (BZERO/BSCALE present: astropy cannot memory-map, it reads the data into RAM)"))
     print(f"Median over {n_runs} runs, after OS cache warm-up")
     print(f"CPU threads used by euclid_fast: {euclid_fast.detected_cpus()}")
     print("=" * 70)
@@ -143,6 +172,10 @@ def main():
           f"({pct_faster(t_astropy_stats, t_rust_stats):.1f}% less time)")
     print(f"Result check: astropy min/max/mean = {astropy_stats_result}")
     print(f"              rust    min/max/mean = {rust_stats_result}")
+
+    if cutout_skipped:
+        print(f"\n--- 2. cutout comparison skipped ---\n{cutout_skipped}")
+        return
 
     print(f"\n--- 2. {size}x{size} cutout extraction by RA/Dec ({ra:.6f}, {dec:.6f}) ---")
     print(f"astropy (WCS + memmap)       : {t_astropy_cutout:8.3f} ms")

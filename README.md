@@ -35,25 +35,31 @@ euclid_fast.export_cutout_parquet("tile.fits", 83.82, -5.39, 50, 50, "cutout.par
 
 ## What kind of files does it work with?
 
-**Short answer: one specific kind of FITS file, a plain 2-D image.**
+**Short answer: uncompressed 2-D FITS images, whether the image sits in the
+primary HDU or in an extension.**
 
 FITS (Flexible Image Transport System) is the standard file format of
 astronomy. A FITS file is a sequence of blocks called HDUs ("header/data
 units"): each has a text header and a payload, which can be an image or a
-table. `euclid_fast` reads **images**: a rectangular grid of pixels (a
-sky mosaic, for example) stored in the **first HDU** of the file (the
-"primary HDU"), plus the header keywords that say how pixels map to the sky
-(the WCS). The reference example is a Euclid **MER mosaic tile**
-(`EUC_MER_BGSUB-MOSAIC-NIR-Y_TILE...fits`, a 19200 × 19200 float32 image),
-which is exactly what the benchmarks use.
+table. `euclid_fast` reads **images**: a rectangular grid of pixels (a sky
+mosaic, a detector frame...), plus the header keywords that say how pixels
+map to the sky (the WCS).
+
+Where the image sits depends on the product. A Euclid **MER mosaic** keeps
+its image in the first HDU (the "primary HDU"), which is what `euclid_fast`
+reads by default. **Calibrated frames** (VIS, NISP) and **raw frames** have
+an *empty* primary HDU and one image extension per detector, with names such
+as `DET11.SCI` or `1-1.E`. For those you pick the HDU with the `hdu=`
+argument (an index or a name), and `list_hdus(path)` shows what a file
+contains.
 
 **Supported:**
 
 | Requirement | Details |
 |---|---|
-| Uncompressed image in the primary HDU | A 2-D image (`NAXIS = 2`), with the pixels in the first HDU of the file |
-| Pixel type (`BITPIX`) | `8`, `16`, `32` (integers), `-32`, `-64` (floating point). `BZERO` / `BSCALE` are applied |
-| WCS, only needed for cutouts | `CTYPE1/2 = RA---TAN / DEC--TAN`, with `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix (`CD1_1`, `CD2_2`, and `CD1_2`, `CD2_1` if rotated). `fits_stats` needs no WCS |
+| An image HDU | 2-D (`NAXIS = 2`) and uncompressed. The primary HDU by default, or any image extension through `hdu=` (0-based index or `EXTNAME`) |
+| Pixel type (`BITPIX`) | `8`, `16`, `32`, `64` (integers), `-32`, `-64` (floating point). `BZERO` / `BSCALE` are applied, so unsigned 16-bit raw data (`BZERO = 32768`) works. 64-bit integers are converted to `float64`, which is exact up to 2^53 (about 9 × 10^15) |
+| WCS, only needed for cutouts | `CTYPE1/2 = RA---TAN / DEC--TAN`, **or** `RA---TPV / DEC--TPV` (the tangent projection plus the polynomial distortion `PV1_m` / `PV2_m` used by the Euclid VIS pipeline), together with `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix (`CD1_1`, `CD2_2`, and `CD1_2`, `CD2_1` if rotated). `fits_stats` needs no WCS |
 
 **Not supported.** Anything else is rejected with a `ValueError` that says
 why, rather than being read wrongly (these cases are covered by
@@ -61,34 +67,59 @@ why, rather than being read wrongly (these cases are covered by
 
 | Kind of file | Error you get |
 |---|---|
-| Compressed images (Rice / GZIP tiles, `.fits.fz`), or an image stored in an extension rather than the primary HDU (multi-extension FITS), including tables and catalogues | `the primary HDU holds no image (NAXIS = 0): the image is probably stored in an extension or is tile-compressed ...` |
-| 3-D cubes (`NAXIS = 3`) | `NAXIS = 3 is not supported: only 2-D images are handled` |
-| `BITPIX = 64` | `BITPIX 64 is not supported yet` |
+| Compressed images (Rice / GZIP tiles, `.fits.fz`) | With no `hdu`: `the primary HDU holds no image (NAXIS = 0); it contains: [1] SCI (tile-compressed image, not supported yet)`. With `hdu=1`: `HDU 1 (SCI) is a tile-compressed image (ZIMAGE), which is not supported yet` |
+| An extension that is a table (catalogue, spectrum...) | `HDU 1 is a BINTABLE table, not an image` |
+| 3-D cubes (`NAXIS = 3`) | `NAXIS = 3 is not supported ...: only 2-D images are handled` |
 | Not a FITS file | `truncated file: no END card found` |
-| A projection other than TAN (`SIN`, `ARC`...), TAN with SIP distortion (`CTYPE` ending in `-SIP`), or a missing `CTYPE` | Cutouts raise `unsupported WCS projection: expected CTYPE1/CTYPE2 = RA---TAN/DEC--TAN, found ...` (`fits_stats` still works) |
+| A projection other than TAN / TPV (`SIN`, `ARC`...), SIP distortion (`CTYPE` ending in `-SIP`), or a missing `CTYPE` | Cutouts raise `unsupported WCS projection: expected CTYPE1/CTYPE2 = RA---TAN/DEC--TAN or RA---TPV/DEC--TPV, found ...` (`fits_stats` still works) |
 | WCS written with `CDELT` (+`PC`) instead of a `CD` matrix, or no WCS at all | Cutouts raise `this file has no WCS header` (`fits_stats` still works) |
 
-To check a file before running anything on it, look at its header with
-astropy:
+If you forget `hdu=` on a file whose primary HDU is empty, the error lists
+the image HDUs it found and tells you what to pass, for example
+`[1] DET11.SCI (2040x2040, BITPIX -32) ... Pass hdu=<index or EXTNAME>`.
+
+**What this means for Euclid Q1 data.** I read the headers of a handful of
+files in each product family of the public Q1 release (this is a sample, not
+a full survey of the archive) and ran the code on real files from four of
+them, comparing with astropy:
+
+| Product | Where the image is | Status |
+|---|---|---|
+| MER mosaics (`EUC_MER_BGSUB-MOSAIC-...`, uncompressed) | primary HDU | **Works** (stats and cutouts). All benchmark numbers come from the NISP Y-band tile. The other bands and the `RMS` / `FLAG` mosaics have the same layout but were not run |
+| NISP calibrated frames (`EUC_NIR_W-CAL-IMAGE-BKG...`) | extensions `DETnn.SCI`, `.RMS`, `.DQ` (`TAN` WCS) | **Works** with `hdu="DET11.SCI"` etc. Checked on one detector: stats and a cutout identical to astropy |
+| VIS calibrated frames (`EUC_VIS_SWL-BKG...`) | extensions `1-1.E`... (`TPV` WCS) | **Works** with `hdu="1-1.E"` etc. Checked on one detector: stats identical to astropy; over 300 random sky positions the cutout center agrees with astropy/wcslib to 3 × 10^-8 pixel, and all cutout pixels are identical |
+| RAW frames, NISP (`EUC_LE1_NISP...`) | extensions `DETnn.SCI` (unsigned 16-bit via `BZERO`) | **Stats work** (checked on one detector). Cutouts are refused: the WCS is in detector-mosaic coordinates (`Y_MOSA`), not sky coordinates |
+| RAW frames, VIS (`EUC_LE1_VIS...`) | extensions `1-1.E`... | Same layout as the other frames, **not run** |
+| MER segmentation maps (`EUC_MER_FINAL-SEGMAP...`) | primary HDU, `BITPIX = 64` | **Stats work** (checked on the real 2.9 GB file: min, max and mean identical to astropy to ~13 digits). No `CD` matrix in the header, so no cutouts |
+| Catalogues, PSF files, other tables | table extensions | Not images, out of scope |
+
+None of the Q1 image files I looked at were tile-compressed.
+
+To check a file yourself before running anything on it, list its HDUs:
+
+```python
+import euclid_fast
+for hdu in euclid_fast.list_hdus("file.fits"):
+    print(hdu)
+# <HduInfo index=0 kind=PRIMARY shape=- bitpix=8 readable=no (no image data)>
+# <HduInfo index=1 name="DET11.SCI" kind=IMAGE shape=2040x2040 bitpix=-32 readable=yes>
+```
+
+or look at the header keywords with astropy:
 
 ```python
 from astropy.io import fits
 
-h = fits.getheader("file.fits", 0)                  # header of the primary HDU
+h = fits.getheader("file.fits", 1)          # 0 = primary HDU, 1 = first extension...
 print("NAXIS", h["NAXIS"], "| BITPIX", h["BITPIX"])
 print("CTYPE", h.get("CTYPE1"), h.get("CTYPE2"))
 print("CD matrix present:", "CD1_1" in h and "CD2_2" in h)
 ```
 
-You want `NAXIS 2`, a `BITPIX` from the table above, `CTYPE RA---TAN
-DEC--TAN` and `CD matrix present: True`. If `NAXIS` is `0`, your image is in
-an extension or compressed, which is not supported yet.
+You want `NAXIS 2`, a `BITPIX` from the table above, `CTYPE` `RA---TAN
+DEC--TAN` or `RA---TPV DEC--TPV`, and `CD matrix present: True` (the last two
+only matter for cutouts).
 
-On Euclid data, the files that fit are the uncompressed **MER mosaics**
-(file names containing `MOSAIC`). Only the NISP Y-band `BGSUB-MOSAIC` tile
-has been tested; the other bands and the `RMS` / `FLAG` mosaics have the
-same layout but were not tried. Euclid catalogues and single-exposure
-frames are not images in the primary HDU and are out of scope for now.
 ## How Python and Rust fit together (PyO3)
 
 If you are an astronomer who knows Python but has never touched Rust, this
@@ -100,15 +131,18 @@ Under the hood there are three pieces:
 | Piece | Where | What it does |
 |---|---|---|
 | The Rust code | `euclid_fast/src/lib.rs` | Does the actual work: memory-maps the FITS file, runs the parallel computation, converts sky coordinates to pixels |
-| **PyO3** | a dependency in `euclid_fast/Cargo.toml` | A Rust library that turns Rust functions and structs into Python functions and objects |
+| **PyO3** | a dependency in `euclid_fast/Cargo.toml` | A Rust library that turns Rust functions and structs into Python functions and objects, and converts arguments between the two (for example, `hdu=` accepts a Python `int` or `str`, which PyO3 maps to a Rust `enum`) |
 | **maturin** | `build-backend` in `euclid_fast/pyproject.toml` | Compiles the Rust into a shared library and installs it in your Python environment (`pip` calls it for you) |
 
 PyO3 shows up in `lib.rs` as a handful of annotations. Here is the whole
 mapping, taken from the real code:
 
 ```rust
+#[derive(FromPyObject)]                         // -> accepts a Python int OR str
+enum HduSelector { Index(usize), Name(String) }
+
 #[pyfunction]                                   // -> a Python function
-fn fits_stats(path: &str) -> PyResult<FitsStats> { /* ... */ }
+fn fits_stats(path: &str, hdu: Option<HduSelector>) -> PyResult<FitsStats> { /* ... */ }
 
 #[pyclass]                                      // -> a Python class
 struct FitsStats {
@@ -194,9 +228,8 @@ in editable mode and rebuilds it after you change `src/lib.rs`.
 ## Use it
 
 You need a FITS file of the kind described in
-[What kind of files does it work with?](#what-kind-of-files-does-it-work-with):
-an uncompressed 2-D image in the primary HDU, with an `RA---TAN` WCS if you
-want cutouts. Euclid MER mosaics are of this kind; see
+[What kind of files does it work with?](#what-kind-of-files-does-it-work-with).
+Euclid MER mosaics are of this kind; see
 [the benchmark section](#run-the-benchmark-on-your-own-fits-file) for where
 to get one.
 
@@ -205,6 +238,10 @@ import numpy as np
 import euclid_fast
 
 path = "tile.fits"
+
+# 0. What is in the file? (reads the headers only, instant)
+for hdu in euclid_fast.list_hdus(path):
+    print(hdu)
 
 # 1. Global statistics over the whole image
 s = euclid_fast.fits_stats(path)
@@ -226,31 +263,49 @@ import pandas as pd                  # pip install pandas pyarrow
 print(pd.read_parquet("cutout.parquet").head())       # columns: x, y, value
 ```
 
+**Files whose images are in extensions** (Euclid calibrated and raw frames)
+need the `hdu` argument, a name or a 0-based index, on all three functions:
+
+```python
+frame = "EUC_NIR_W-CAL-IMAGE-BKG_H-2681-0_20240930T175032.222263Z.fits"
+
+s = euclid_fast.fits_stats(frame, hdu="DET11.SCI")              # by EXTNAME
+s = euclid_fast.fits_stats(frame, hdu=1)                        # by index (same HDU)
+c = euclid_fast.extract_cutout(frame, 266.09, 67.32, 50, 50, hdu="DET11.SCI")
+```
+
+(names are matched case-insensitively; if several HDUs share a name, the
+first one is used).
+
 Reference:
 
 | Function | Returns | Fields |
 |---|---|---|
-| `fits_stats(path)` | `FitsStats` | `min`, `max`, `mean`, `naxis1`, `naxis2`, `bitpix`, `threads_used`, `elapsed_ms` |
-| `extract_cutout(path, ra_deg, dec_deg, width, height)` | `Cutout` | `data` (flat list of floats, row-major), `width`, `height`, `pixel_x_center`, `pixel_y_center`, `elapsed_ms` |
-| `export_cutout_parquet(path, ra_deg, dec_deg, width, height, out_path)` | `ParquetExport` | `out_path`, `rows`, `elapsed_ms` |
+| `fits_stats(path, hdu=None)` | `FitsStats` | `min`, `max`, `mean`, `naxis1`, `naxis2`, `bitpix`, `threads_used`, `elapsed_ms` |
+| `extract_cutout(path, ra_deg, dec_deg, width, height, hdu=None)` | `Cutout` | `data` (flat list of floats, row-major), `width`, `height`, `pixel_x_center`, `pixel_y_center`, `elapsed_ms` |
+| `export_cutout_parquet(path, ra_deg, dec_deg, width, height, out_path, hdu=None)` | `ParquetExport` | `out_path`, `rows`, `elapsed_ms` |
+| `list_hdus(path)` | list of `HduInfo` | per HDU: `index`, `kind` (`PRIMARY`, `IMAGE`, `BINTABLE`...), `name`, `bitpix`, `shape` (NAXIS1, NAXIS2...), `readable`, `note` (why it is not readable) |
 | `detected_cpus()` | `int` | number of logical cores found on this machine |
 
-Notes: `Cutout.data` is a plain Python list, so convert it with
-`np.array(...)` as above (fine for cutouts; it is not meant for
-multi-megapixel regions). The Parquet file has one row per pixel with
-columns `x`, `y` (absolute pixel coordinates in the source image) and
-`value`. All errors (file not found, unsupported `BITPIX`, cutout outside
-the image, no WCS in the header...) are raised as `ValueError`.
+Notes: `hdu=None` (the default) reads the primary HDU, exactly like before.
+`Cutout.data` is a plain Python list, so convert it with `np.array(...)` as
+above (fine for cutouts; it is not meant for multi-megapixel regions). The
+Parquet file has one row per pixel with columns `x`, `y` (absolute pixel
+coordinates in the source image) and `value`. All errors (file not found,
+wrong kind of HDU, cutout outside the image, unsupported WCS...) are raised
+as `ValueError`.
 
 ## Run the tests (optional)
 
 `tests/test_input_validation.py` builds small FITS files with astropy and
-checks that supported files work and unsupported ones are rejected with a
-clear error. With `euclid_fast` installed and `pip install -r
-scripts/requirements.txt` done:
+checks that supported files work (primary HDU, extensions, `BITPIX` 16 and
+64, `BZERO`/`BSCALE`), that unsupported ones are rejected with a clear error,
+and that the TPV distortion agrees with astropy/wcslib on a strongly
+distorted synthetic header. It needs no download. With `euclid_fast`
+installed and `pip install -r scripts/requirements.txt` done:
 
 ```bash
-python tests/test_input_validation.py     # prints "all input-validation checks passed"
+python tests/test_input_validation.py     # prints "all checks passed"
 ```
 
 (`pytest tests/` works too.)
@@ -262,13 +317,18 @@ against `astropy` on a file of your choice, and checks that both give the
 same answer.
 
 **1. Get a FITS file.** Use any file that matches the
-[requirements above](#what-kind-of-files-does-it-work-with). To reproduce the numbers in this README, use
-the Euclid Q1 tile they were measured on, from the public IRSA mirror
-(anonymous S3 bucket `nasa-irsa-euclid-q1`, no account needed, 1.47 GB):
+[requirements above](#what-kind-of-files-does-it-work-with). To reproduce the
+numbers in this README, use the Euclid Q1 tile they were measured on, from
+the public IRSA mirror (anonymous S3 bucket `nasa-irsa-euclid-q1`, no account
+needed, 1.47 GB):
 
 <https://nasa-irsa-euclid-q1.s3.amazonaws.com/q1/MER/102160339/NISP/EUC_MER_BGSUB-MOSAIC-NIR-Y_TILE102160339-3A9BC7_20241024T231706.521789Z_00.00.fits>
 
-Download it with your browser, `curl` or `wget`, and put it anywhere.
+Download it with your browser, `curl` or `wget`, and put it anywhere. To try
+a **calibrated frame** instead (images in extensions), these are public too:
+
+- NISP, 799 MB (`TAN` WCS): <https://nasa-irsa-euclid-q1.s3.amazonaws.com/q1/NIR/2681/EUC_NIR_W-CAL-IMAGE-BKG_H-2681-0_20240930T175032.222263Z.fits>
+- VIS, 2.4 GB (`TPV` WCS): <https://nasa-irsa-euclid-q1.s3.amazonaws.com/q1/VIS/2681/EUC_VIS_SWL-BKG-002681-00-1-0000000__20241017T042839.727792Z.fits>
 
 **2. Install the benchmark's two dependencies** (inside the same virtual
 environment you installed `euclid_fast` in):
@@ -281,27 +341,35 @@ pip install -r scripts/requirements.txt     # numpy + astropy
 
 ```bash
 python scripts/benchmark_vs_astropy_real.py /path/to/tile.fits
+python scripts/benchmark_vs_astropy_real.py /path/to/frame.fits --hdu DET11.SCI   # image in an extension
 ```
 
-Optional flags: `--ra` / `--dec` (cutout center in degrees; defaults to the
-image center from the FITS header), `--size` (cutout width and height in
-pixels, default 50) and `--runs` (repetitions per measurement, default 5).
+Optional flags: `--hdu` (the HDU holding the image, an `EXTNAME` or a 0-based
+index; default: the primary HDU), `--ra` / `--dec` (cutout center in degrees;
+default: the sky position of the image center, taken from the file's own
+WCS), `--size` (cutout width and height in pixels, default 50) and `--runs`
+(repetitions per measurement, default 5). If the file has no sky WCS (raw
+detector frames, for example), the cutout comparison is skipped with an
+explanation and the global-stats comparison still runs. If the file uses
+`BZERO`/`BSCALE`, astropy cannot memory-map it and reads it into RAM; the
+script says so, and the comparison is then less favourable to astropy than
+usual for reasons unrelated to `euclid_fast`.
 
 **4. Read the output.** It prints, for each of the two operations, the median
 time of both tools, the speedup, and a correctness check:
 
 ```
 --- 1. Global stats (min/max/mean over the whole file) ---
-astropy (memmap, numpy)      :   476.15 ms
-euclid_fast (Rust/rayon)     :   130.28 ms
-Speedup                      : ×3.65  (72.6% less time)
+astropy (memmap, numpy)      :   476.49 ms
+euclid_fast (Rust/rayon)     :   130.05 ms
+Speedup                      : ×3.66  (72.7% less time)
 Result check: astropy min/max/mean = (-111.43283081054688, 15220.939453125, 1.0181564092636108)
               rust    min/max/mean = (-111.43283081054688, 15220.939453125, 1.0181568676826722)
 
---- 2. 50x50 cutout extraction by RA/Dec (273.071660, 68.000000) ---
-astropy (WCS + memmap)       :    2.663 ms
-euclid_fast (Rust/mmap)      :    0.216 ms
-Speedup                      : ×12.36  (91.9% less time)
+--- 2. 50x50 cutout extraction by RA/Dec (273.071586, 68.000028) ---
+astropy (WCS + memmap)       :    2.670 ms
+euclid_fast (Rust/mmap)      :    0.224 ms
+Speedup                      : ×11.91  (91.6% less time)
 ...
               all 2500 pixels identical: True
 ```
@@ -321,10 +389,13 @@ loads the file into its cache.
 | Build error mentioning `edition2024` | Your Rust is older than 1.85. Run `rustup update`. |
 | `linker 'cc' not found` (Linux) / `link.exe not found` (Windows) | Install a C toolchain: `sudo apt install build-essential`, or the Visual Studio C++ Build Tools. |
 | `ModuleNotFoundError: No module named 'euclid_fast'` | You are in a different Python than the one you installed into. Activate the virtual environment (`source .venv/bin/activate`) and retry; check with `pip show euclid_fast`. |
-| `ValueError: the primary HDU holds no image (NAXIS = 0)`, `NAXIS = 3 is not supported`, `BITPIX ... is not supported` or `no END card found` | The file is not a plain uncompressed 2-D image in the primary HDU (compressed, multi-extension, cube, table, not FITS...). See [What kind of files does it work with?](#what-kind-of-files-does-it-work-with). |
-| `ValueError: unsupported WCS projection ...` | The cutout functions only implement the plain `RA---TAN` / `DEC--TAN` projection. SIN, SIP and other WCS types are not supported yet. |
-| `ValueError: this file has no WCS header` | The cutout functions need `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix. `fits_stats` still works without them. |
-| `ValueError: cutout outside the image` | The RA/Dec you asked for falls outside the image. Check the coordinates against the header's `CRVAL1/2`. |
+| `ValueError: the primary HDU holds no image (NAXIS = 0); it contains: ...` | The image is in an extension (Euclid calibrated/raw frames). Pass `hdu=` with the name or index shown in the message. |
+| `ValueError: no HDU named '...'` / `no HDU with index ...` | Wrong `hdu` value. The message lists the available HDUs; `euclid_fast.list_hdus(path)` shows them all. |
+| `ValueError: ... is a tile-compressed image` or `... is a BINTABLE table, not an image` | That HDU is compressed or is a table. Compressed images are not supported yet; see [What kind of files does it work with?](#what-kind-of-files-does-it-work-with). |
+| `ValueError: NAXIS = 3 is not supported` or `no END card found` | A 3-D cube, or a file that is not FITS. Only 2-D images are handled. |
+| `ValueError: unsupported WCS projection ...` | The cutout functions implement the `RA---TAN` / `DEC--TAN` projection and the `RA---TPV` / `DEC--TPV` polynomial distortion. SIN, SIP and other WCS types are not supported yet. |
+| `ValueError: this file has no WCS header` | The cutout functions need `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix in the chosen HDU. `fits_stats` still works without them. |
+| `ValueError: cutout outside the image` | The RA/Dec you asked for falls outside the image. Check the coordinates, and for frames make sure `hdu=` is the detector you mean (each detector covers a different patch of sky). |
 | The benchmark exits asking for `numpy`/`astropy` | Run `pip install -r scripts/requirements.txt` in the same environment. |
 
 ## Motivation
@@ -352,14 +423,14 @@ many-core workstation.
 
 ## What it does today
 
-Three operations, each independently benchmarked against `astropy` on
+Three operations (plus `list_hdus` to see what a file contains), each independently benchmarked against `astropy` on
 identical input and compared for numerical correctness, not just speed:
 
 | Function | What it computes | Notes |
 |---|---|---|
-| `fits_stats(path)` | Global `min` / `max` / `mean` over the primary HDU | `mmap` + `rayon`, chunked reduction tuned for this workload |
-| `extract_cutout(path, ra_deg, dec_deg, width, height)` | Pixel-space cutout around a sky position | Standard TAN (gnomonic) WCS, FITS 1-indexed convention |
-| `export_cutout_parquet(path, ra_deg, dec_deg, width, height, out_path)` | Same cutout, written as Parquet | One row per pixel: columns `x`, `y` (absolute pixel coords in the source image), `value` (physical value, `BZERO`/`BSCALE` applied) |
+| `fits_stats(path, hdu=None)` | Global `min` / `max` / `mean` over one image HDU (the primary one by default) | `mmap` + `rayon`, chunked reduction tuned for this workload |
+| `extract_cutout(path, ra_deg, dec_deg, width, height, hdu=None)` | Pixel-space cutout around a sky position | TAN (gnomonic) WCS, or TAN with TPV polynomial distortion; FITS 1-indexed convention |
+| `export_cutout_parquet(path, ra_deg, dec_deg, width, height, out_path, hdu=None)` | Same cutout, written as Parquet | One row per pixel: columns `x`, `y` (absolute pixel coords in the source image), `value` (physical value, `BZERO`/`BSCALE` applied) |
 
 ## Benchmark results
 
@@ -441,22 +512,27 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
 ## Known limitations (read before relying on this for science)
 
 - **No compressed-tile support yet.** Only uncompressed FITS data is
-  handled. Rice/GZIP-compressed tiles (common in real archival data)
-  require a decompression step that `euclid_fast` does not implement
-  yet; that step necessarily costs a copy, but should still outperform
-  the `cfitsio`/GIL path once added.
-- **No SIP distortion.** The WCS transform is a pure linear TAN
-  projection (`CRVAL`/`CRPIX`/`CD` matrix only). Real survey data with
-  significant optical distortion (SIP polynomial terms) will need that
-  added before cutout positions can be trusted at the sub-pixel level.
-- **Single HDU, single file.** No multi-extension FITS, no batch
-  processing across a file list (yet — see Roadmap).
-
-- **Real-data validation is currently one file, one band.** The results
-  above come from a single Q1 NISP tile out of the ~35 TB Q1 release —
-  enough to confirm the approach works unmodified on a real archival
-  product, not yet a representative sample across instruments, bands and
-  tiles.
+  handled. Rice/GZIP-compressed tiles (used by many archives, although none
+  of the Q1 image files I checked were compressed) require a decompression
+  step that `euclid_fast` does not implement yet; that step necessarily
+  costs a copy, but should still outperform the `cfitsio`/GIL path once
+  added.
+- **One image per call.** Each call reads a single HDU of a single file; no
+  batch processing across a file list or all the detectors of a frame at once
+  (yet — see Roadmap).
+- **WCS: TAN and TPV only.** Cutouts do not handle SIP distortion
+  (`TAN-SIP`) or other projections, and they require the `CD` matrix form.
+  The TPV inverse (sky to pixel) is solved iteratively and agrees with
+  astropy to ~10^-8 pixel on the real VIS frame tested, but it has only been
+  checked on that one frame and on a synthetic header.
+- **Real-data validation is small.** The benchmark numbers above come from
+  a single Q1 NISP mosaic tile out of the ~35 TB Q1 release. Correctness
+  (not speed) was also checked against astropy on one NISP frame, one VIS
+  frame, one raw NISP detector and one segmentation map. That is enough to
+  show the approach works on real archival products, not a representative
+  sample across instruments, bands and tiles.
+- **64-bit integers are converted to `float64`**, which is exact up to 2^53
+  (about 9 × 10^15). Larger values would lose precision.
 - **Tested on one platform.** Linux (Debian 13, x86_64) only so far.
 
 ## Roadmap
@@ -465,7 +541,7 @@ This is the first of four planned components for Euclid-scale data
 processing, chosen first specifically because it needed no GPU/cluster
 and is the foundation the others build on:
 
-1. ✅ **FITS streaming / cutout / Parquet export** (this package).
+1. ✅ **FITS streaming / cutout / Parquet export** (this package). Next steps for this component, in the order I would do them: batch access to many files or all detectors of a frame, SIP distortion, then tile-compressed images (none of the Q1 image files I checked were compressed, so this is not urgent).
 2. Catalogue cross-matching at the hundred-million-to-billion-object
    scale (HEALPix / spherical KD-tree indexing, memory-mapped for
    datasets larger than available RAM).
