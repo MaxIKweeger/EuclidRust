@@ -3,7 +3,9 @@
 High-performance FITS I/O for Python, written in Rust and exposed via
 [PyO3](https://pyo3.rs/) as a normal, `pip install`-able Python extension
 module. Built as a testbed for data-processing tools for the ESA **Euclid**
-mission, but useful for any FITS-based workflow.
+mission, but useful for any FITS-based workflow. The repository is called
+**EuclidRust**; the Python package inside it, and the name you `import`, is
+`euclid_fast`.
 
 ```python
 import euclid_fast
@@ -207,8 +209,8 @@ automatically during the build, so the first install needs internet access.
 ### 2. Get the code and install
 
 ```bash
-git clone https://github.com/MaxIKweeger/Euclid.git
-cd Euclid
+git clone https://github.com/MaxIKweeger/EuclidRust.git
+cd EuclidRust
 
 python3 -m venv .venv                 # a private Python environment
 source .venv/bin/activate             # Windows PowerShell: .venv\Scripts\Activate.ps1
