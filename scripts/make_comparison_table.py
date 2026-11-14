@@ -148,13 +148,15 @@ def main(paths):
                "runs at 20.3 GB/s (PC) and 23.8 GB/s (NUC) on ordinary data, but at 6.9 GB/s (PC, Windows) and 15.0 GB/s "
                "(NUC, Linux) on big-endian data. That column mostly measures numpy's big-endian path on Windows, not the "
                "processor.")
-    out.append("- **EuclidRust is not faster on the i9 than on the i7:** it uses all threads, but the computation is "
-               "limited by memory bandwidth (the PC's memory runs at 2133 MT/s, the NUC's at 2400 MT/s), not by the "
-               "processor.")
+    out.append("- **EuclidRust gains little on the i9 over the i7 for the raw tile (119 ms vs 132 ms, ×1.1)** despite "
+               "more than twice the cores and a third more clock speed: the computation is bound by memory bandwidth, "
+               "not by the processor. The PC's memory runs at 2933 MT/s (measured at about 37 GB/s with many threads), "
+               "the NUC's at 2400 MT/s. On the Rice-compressed tile, decoding each tile leaves more work per byte "
+               "fetched, so the i9 pulls further ahead (384 ms vs 1,211 ms, ×3.2).")
     out.append("- **The GPU is slower than the CPU on the raw image:** the 1.47 GB cross PCIe 3.0 (12.9 GB/s measured, "
-               "114 ms at best) after a copy into page-locked memory, while the CPU reads them once. The computation on "
-               "the card takes 10 ms. The GPU wins when the transfer is small (Rice-compressed file, 0.31 GB) or paid "
-               "once (image already in GPU memory).")
+               "114 ms at best) after a copy into page-locked memory, while the CPU now reads them in 119 ms. The "
+               "computation on the card takes 10 ms. The GPU wins when the transfer is small (Rice-compressed file, "
+               "0.31 GB) or paid once (image already in GPU memory).")
     out.append("")
     sys.stdout.reconfigure(encoding="utf-8", newline="\n")        # "×" must not depend on the console's code page
     print("\n".join(out))

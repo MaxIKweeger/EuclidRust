@@ -17,8 +17,8 @@
   "runs": 7,
   "euclidrust_threads": 20,
   "stats": {
-    "astropy_ms": 4074.481799998466,
-    "euclidrust_cpu_ms": 393.21400000335416,
+    "astropy_ms": 3848.805999999996,
+    "euclidrust_cpu_ms": 383.93859999999336,
     "astropy_result": [
       -111.43427276611328,
       15220.935546875,
@@ -33,15 +33,15 @@
       "available": true,
       "name": "NVIDIA GeForce RTX 4070 Ti",
       "memory_mb": 12281,
-      "end_to_end_ms": 75.43889999942621,
+      "end_to_end_ms": 67.34009999999557,
       "matches_cpu": true,
       "unsupported": "GPU: a tile-compressed image cannot be kept on the GPU: it is decoded tile by tile as it is used"
     }
   },
   "cutout": {
     "size": 50,
-    "astropy_ms": 19.441500000539236,
-    "euclidrust_cpu_ms": 2.631800001836382,
+    "astropy_ms": 19.30949999999143,
+    "euclidrust_cpu_ms": 2.507799999989402,
     "identical_pixels": true
   }
 }

@@ -17,8 +17,8 @@
   "runs": 9,
   "euclidrust_threads": 20,
   "stats": {
-    "astropy_ms": 1299.2023000006157,
-    "euclidrust_cpu_ms": 125.08059999890975,
+    "astropy_ms": 1187.496600000003,
+    "euclidrust_cpu_ms": 118.74420000000896,
     "astropy_result": [
       -111.43283081054688,
       15220.939453125,
@@ -33,16 +33,16 @@
       "available": true,
       "name": "NVIDIA GeForce RTX 4070 Ti",
       "memory_mb": 12281,
-      "end_to_end_ms": 243.11519999901066,
+      "end_to_end_ms": 193.89799999999013,
       "matches_cpu": true,
-      "upload_ms": 264.79789999999997,
-      "resident_ms": 10.310999998182524
+      "upload_ms": 214.0153,
+      "resident_ms": 10.054300000007288
     }
   },
   "cutout": {
     "size": 50,
-    "astropy_ms": 3.560100001777755,
-    "euclidrust_cpu_ms": 0.274800000624964,
+    "astropy_ms": 3.3310000000028595,
+    "euclidrust_cpu_ms": 0.2289000000246233,
     "identical_pixels": true
   }
 }

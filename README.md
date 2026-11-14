@@ -410,11 +410,11 @@ better; the full table, with the machines, is in
 
 | | astropy CPU i7 | astropy CPU i9 | EuclidRust CPU i7 NUC | EuclidRust CPU i9 | Euclid GPU RTX 4070 Ti |
 |---|---|---|---|---|---|
-| Raw tile 1.47 GB: min / max / mean | 478 | 1,299 | 132 | 125 | 243 |
-| same, image already on the GPU | | | | | **10.3** |
-| 50×50 cutout (always on the CPU) | 2.70 | 3.56 | 0.22 | 0.27 | (CPU) |
-| Rice-compressed tile 0.31 GB: min / max / mean | 3,603 | 4,074 | 1,211 | 393 | **75** |
-| 50×50 cutout (always on the CPU) | 17.1 | 19.4 | 3.55 | 2.63 | (CPU) |
+| Raw tile 1.47 GB: min / max / mean | 478 | 1,187 | 132 | 119 | 194 |
+| same, image already on the GPU | | | | | **10.1** |
+| 50×50 cutout (always on the CPU) | 2.70 | 3.33 | 0.22 | 0.23 | (CPU) |
+| Rice-compressed tile 0.31 GB: min / max / mean | 3,603 | 3,849 | 1,211 | 384 | **67** |
+| 50×50 cutout (always on the CPU) | 17.1 | 19.3 | 3.55 | 2.51 | (CPU) |
 
 ### How to read these numbers
 
@@ -423,7 +423,7 @@ measurement error: the same file (1,474,565,760 bytes), the same Python and astr
 (numpy 2.5.4, astropy 8.0.2), the data already in the operating system's cache, the median of
 several runs, and the same minimum, maximum and mean to the last digit on every machine.
 
-1. **astropy is slower on the i9 (1,299 ms) than on the i7 (478 ms), although the i9 is the
+1. **astropy is slower on the i9 (1,187 ms) than on the i7 (478 ms), although the i9 is the
    more powerful processor.** astropy and numpy compute on **one core**, so the 10 cores of the
    i9 do not help them. FITS stores numbers big-endian (`>f4`), and numpy has to swap the bytes of
    every value before it can compute. I measured numpy's `min()` on 64 MB of float32: on ordinary
@@ -432,15 +432,18 @@ several runs, and the same minimum, maximum and mean to the last digit on every 
    15.0 GB/s. So that column mostly measures numpy's big-endian path on Windows, not the
    processor. Reading the file adds about 0.5 s on the PC. I did not investigate why numpy is
    slower there (compiler or build options are the likely suspects).
-2. **EuclidRust is not faster on the i9 (125 ms) than on the i7 (132 ms).** It uses all 20
-   threads of the i9, but the work is limited by how fast the memory delivers 1.47 GB, not by
-   the processor. The memory of this PC runs at 2133 MT/s (the processor supports up to 2933),
-   that of the NUC at 2400 MT/s. Adding cores cannot help a memory-bound computation.
-3. **The GPU is slower than the CPU on the raw image (243 ms against 125 ms).** The image has to
+2. **EuclidRust gains little on the i9 (119 ms) over the i7 (132 ms) for the raw tile, despite
+   more than twice the cores and a third more clock speed.** The work is limited by how fast
+   the memory delivers 1.47 GB, not by the processor. The PC's memory runs at 2933 MT/s
+   (measured at about 37 GB/s with many threads, after an earlier XMP misconfiguration was
+   fixed — it ran at 2133 MT/s, ~28 GB/s, before), the NUC's at 2400 MT/s. Adding cores cannot
+   help a memory-bound computation much. On the Rice-compressed tile, decoding each tile leaves
+   more work per byte fetched, so the i9 pulls further ahead of the i7 there (384 ms vs 1,211 ms).
+3. **The GPU is slower than the CPU on the raw image (194 ms against 119 ms).** The image has to
    cross the PCIe 3.0 bus (12.9 GB/s measured, so at least 114 ms for 1.47 GB) after a first
    copy into page-locked memory, whereas the CPU reads it once. The computation on the card
    takes 10 ms: the time is spent moving the data. The GPU wins where the transfer is small or
-   paid once: the Rice-compressed file (0.31 GB, 75 ms) and an image already in GPU memory (10 ms).
+   paid once: the Rice-compressed file (0.31 GB, 67 ms) and an image already in GPU memory (10 ms).
 
 The speed-ups over astropy are real for the user, who runs astropy as it is, but they combine
 two things: using every core, and not byte-swapping. Compare EuclidRust with the other
@@ -448,11 +451,11 @@ columns of the same machine to see the first one alone.
 
 What to take from it:
 
-- **Compressed images: the GPU is the clear winner**, 5.2 times faster than the same code on the
-  20-thread CPU, and 54 times faster than astropy, with **identical results** (minimum,
+- **Compressed images: the GPU is the clear winner**, 5.7 times faster than the same code on the
+  20-thread CPU, and 57 times faster than astropy, with **identical results** (minimum,
   maximum and mean agree to the last digit, the GPU running the same arithmetic as the CPU
   code).
-- **Raw images, one computation: the GPU is slower than the CPU** here (243 ms against 125 ms).
+- **Raw images, one computation: the GPU is slower than the CPU** here (194 ms against 119 ms).
   This PC's CPU only offers PCIe 3.0 (12.9 GB/s measured, so 114 ms at best just to move the
   data) and the file has to be read into page-locked memory first. Once the image is on the
   card, the computation takes **10 ms**, 12 times faster than the CPU: that is where
