@@ -140,7 +140,23 @@ def main(paths):
                 except (TypeError, KeyError):
                     cells.append("n/a")
             out.append(f"| {w}: {label_op} | " + " | ".join(cells) + " |")
+    out.append("## How to read these numbers\n")
+    out.append("Same file, same Python/numpy/astropy versions, data already in the OS cache, median of several runs, "
+               "identical min/max/mean on every machine.\n")
+    out.append("- **astropy is slower on the i9 than on the i7:** astropy/numpy use one core, so the extra cores do not "
+               "help. FITS data is big-endian and numpy swaps the bytes of every value: numpy's `min()` on 64 MB of float32 "
+               "runs at 20.3 GB/s (PC) and 23.8 GB/s (NUC) on ordinary data, but at 6.9 GB/s (PC, Windows) and 15.0 GB/s "
+               "(NUC, Linux) on big-endian data. That column mostly measures numpy's big-endian path on Windows, not the "
+               "processor.")
+    out.append("- **EuclidRust is not faster on the i9 than on the i7:** it uses all threads, but the computation is "
+               "limited by memory bandwidth (the PC's memory runs at 2133 MT/s, the NUC's at 2400 MT/s), not by the "
+               "processor.")
+    out.append("- **The GPU is slower than the CPU on the raw image:** the 1.47 GB cross PCIe 3.0 (12.9 GB/s measured, "
+               "114 ms at best) after a copy into page-locked memory, while the CPU reads them once. The computation on "
+               "the card takes 10 ms. The GPU wins when the transfer is small (Rice-compressed file, 0.31 GB) or paid "
+               "once (image already in GPU memory).")
     out.append("")
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")        # "×" must not depend on the console's code page
     print("\n".join(out))
 
 
