@@ -1,15 +1,16 @@
 """
-Comparaison chronometree : astropy (standard astro) vs euclid_fast (Rust),
-sur le meme fichier et les memes operations, sur ce NUC.
+Timed comparison: astropy (the astronomy standard) vs euclid_fast (Rust),
+on the same file and the same operations, on this NUC.
 
-Operations comparees :
-  1. Stats globales (min/max/mean) sur le fichier entier (1 Go).
-  2. Extraction d'un cutout 50x50 par coordonnees celestes (RA/Dec).
+Operations compared:
+  1. Global stats (min/max/mean) over the whole file (real Euclid Q1 tile).
+  2. Extraction of a 50x50 cutout by sky coordinates (RA/Dec).
 
-Chaque mesure est repetee plusieurs fois (apres un run de chauffe pour que
-le cache disque OS soit dans le meme etat des deux cotes) ; on garde la
-mediane pour eviter qu'un pic isole fausse la comparaison.
+Each measurement is repeated several times (after a warm-up run so that the
+OS disk cache is in the same state on both sides); the median is kept so
+that an isolated spike does not skew the comparison.
 """
+import os
 import statistics
 import time
 from pathlib import Path
@@ -37,13 +38,13 @@ def median_ms(fn):
     return statistics.median(times), times
 
 
-# --- Chauffe : un passage de chaque methode pour que le fichier soit en cache OS ---
+# --- Warm-up: one pass of each method so the file is in the OS cache ---
 with fits.open(PATH, memmap=True) as hdul:
     _ = hdul[0].data.min()
 _ = euclid_fast.fits_stats(PATH)
 
 
-# --- 1. Stats globales ---
+# --- 1. Global stats ---
 def astropy_stats():
     with fits.open(PATH, memmap=True) as hdul:
         data = hdul[0].data
@@ -62,16 +63,16 @@ t_astropy_stats, _ = median_ms(astropy_stats)
 t_rust_stats, _ = median_ms(rust_stats)
 
 
-# --- 2. Cutout par RA/Dec ---
+# --- 2. Cutout by RA/Dec ---
 def astropy_cutout():
     with fits.open(PATH, memmap=True) as hdul:
         header = hdul[0].header
         wcs = WCS(header)
-        x, y = wcs.all_world2pix(RA, DEC, 0)  # 0-indexe
+        x, y = wcs.all_world2pix(RA, DEC, 0)  # 0-indexed
         x0 = int(round(float(x))) - CUTOUT_SIZE // 2
         y0 = int(round(float(y))) - CUTOUT_SIZE // 2
         cutout = hdul[0].data[y0 : y0 + CUTOUT_SIZE, x0 : x0 + CUTOUT_SIZE]
-        return np.array(cutout)  # force la lecture reelle
+        return np.array(cutout)  # force the actual read
 
 
 def rust_cutout():
@@ -87,7 +88,7 @@ t_rust_cutout, _ = median_ms(rust_cutout)
 
 
 def pct_faster(t_baseline, t_new):
-    """% de temps gagne par rapport a la baseline (positif = plus rapide)."""
+    """% of time saved relative to the baseline (positive = faster)."""
     return (1 - t_new / t_baseline) * 100.0
 
 
@@ -96,22 +97,22 @@ def speedup(t_baseline, t_new):
 
 
 print("=" * 70)
-print(f"Fichier : {PATH}  (1,03 Go)")
-print(f"Médiane sur {N_RUNS} runs, après chauffe cache OS")
+print(f"File: {PATH}  ({os.path.getsize(PATH) / 1e9:.2f} GB)")
+print(f"Median over {N_RUNS} runs, after OS cache warm-up")
 print("=" * 70)
 
-print("\n--- 1. Stats globales (min/max/mean sur tout le fichier) ---")
+print("\n--- 1. Global stats (min/max/mean over the whole file) ---")
 print(f"astropy (memmap, numpy)      : {t_astropy_stats:8.2f} ms")
 print(f"euclid_fast (Rust/rayon)     : {t_rust_stats:8.2f} ms")
-print(f"Gain                         : ×{speedup(t_astropy_stats, t_rust_stats):.2f}  "
-      f"({pct_faster(t_astropy_stats, t_rust_stats):.1f}% de temps en moins)")
-print(f"Cohérence résultats : astropy min/max/mean = {astropy_stats_result}")
-print(f"                      rust    min/max/mean = {rust_stats_result}")
+print(f"Speedup                      : ×{speedup(t_astropy_stats, t_rust_stats):.2f}  "
+      f"({pct_faster(t_astropy_stats, t_rust_stats):.1f}% less time)")
+print(f"Result check: astropy min/max/mean = {astropy_stats_result}")
+print(f"              rust    min/max/mean = {rust_stats_result}")
 
-print("\n--- 2. Extraction cutout 50x50 par RA/Dec ---")
+print("\n--- 2. 50x50 cutout extraction by RA/Dec ---")
 print(f"astropy (WCS + memmap)       : {t_astropy_cutout:8.3f} ms")
 print(f"euclid_fast (Rust/mmap)      : {t_rust_cutout:8.3f} ms")
-print(f"Gain                         : ×{speedup(t_astropy_cutout, t_rust_cutout):.2f}  "
-      f"({pct_faster(t_astropy_cutout, t_rust_cutout):.1f}% de temps en moins)")
-print(f"Cohérence résultats : astropy min/max = {astropy_cutout_result.min()}/{astropy_cutout_result.max()}")
-print(f"                      rust    min/max = {min(rust_cutout_result)}/{max(rust_cutout_result)}")
+print(f"Speedup                      : ×{speedup(t_astropy_cutout, t_rust_cutout):.2f}  "
+      f"({pct_faster(t_astropy_cutout, t_rust_cutout):.1f}% less time)")
+print(f"Result check: astropy min/max = {astropy_cutout_result.min()}/{astropy_cutout_result.max()}")
+print(f"              rust    min/max = {min(rust_cutout_result)}/{max(rust_cutout_result)}")
