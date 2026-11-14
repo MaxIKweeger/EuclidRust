@@ -34,21 +34,44 @@ struct Tpv {
     pv2: [f64; N_PV],
 }
 
+/// The zenithal projections (the reference point is the native pole), which
+/// differ only by how the radius R on the plane depends on the angle from the
+/// pole. TPV is TAN followed by a polynomial (see `Tpv`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Proj {
+    Tan, // gnomonic
+    Sin, // orthographic
+    Arc, // zenithal equidistant
+    Stg, // stereographic
+    Zea, // zenithal equal-area
+    Zpn, // zenithal polynomial (coefficients PV2_m)
+}
+
+/// SIP distortion (Shupe et al. 2005): polynomials A and B in the pixel offsets
+/// (u, v) from CRPIX, applied before the CD matrix. Each term is (p, q, coef)
+/// for coef * u^p * v^q.
+#[derive(Debug, Clone)]
+struct Sip {
+    a: Vec<(i32, i32, f64)>,
+    b: Vec<(i32, i32, f64)>,
+}
+
 /// WCS (World Coordinate System) parameters: the standard FITS
-/// "pixel <-> sky coordinates" transformation, using the tangent (TAN)
-/// projection, optionally with TPV polynomial distortion. Absent (`None`) if
-/// the header has no usable astrometry keywords.
-#[derive(Debug, Clone, Copy)]
+/// "pixel <-> sky coordinates" transformation for a zenithal projection,
+/// optionally with TPV or SIP distortion. Absent (`None`) if the header has no
+/// usable astrometry keywords.
+#[derive(Debug, Clone)]
 struct Wcs {
     crval1: f64, // RA of the reference pixel, in degrees
     crval2: f64, // Dec of the reference pixel, in degrees
     crpix1: f64, // reference pixel, axis 1 (FITS convention, 1-indexed)
     crpix2: f64, // reference pixel, axis 2
-    cd1_1: f64,  // WCS matrix, degrees/pixel
-    cd1_2: f64,
-    cd2_1: f64,
-    cd2_2: f64,
-    tpv: Option<Tpv>, // Some(..) when CTYPE is RA---TPV / DEC--TPV
+    cd: [f64; 4], // CD1_1, CD1_2, CD2_1, CD2_2: linear matrix, degrees/pixel
+    proj: Proj,
+    lonpole: f64,      // native longitude of the celestial pole, degrees
+    zpn: [f64; N_PV],  // PV2_m coefficients (ZPN only)
+    tpv: Option<Tpv>,  // Some(..) when CTYPE is RA---TPV / DEC--TPV
+    sip: Option<Sip>,  // Some(..) when CTYPE is RA---TAN-SIP / DEC--TAN-SIP
 }
 
 /// Everything we read from one HDU header.
@@ -76,6 +99,13 @@ struct RawHeader {
     ctype2: Option<String>,
     pv1: Vec<Option<f64>>,
     pv2: Vec<Option<f64>>,
+    cdelt1: Option<f64>,
+    cdelt2: Option<f64>,
+    pc: [Option<f64>; 4], // PC1_1, PC1_2, PC2_1, PC2_2
+    crota2: Option<f64>,
+    lonpole: Option<f64>,
+    sip_a: Vec<(i32, i32, f64)>,
+    sip_b: Vec<(i32, i32, f64)>,
     // --- tile-compressed images (a BINTABLE with ZIMAGE = T) ---
     zbitpix: Option<i32>,
     znaxis: Option<usize>,
@@ -118,6 +148,13 @@ impl RawHeader {
             ctype2: None,
             pv1: vec![None; N_PV],
             pv2: vec![None; N_PV],
+            cdelt1: None,
+            cdelt2: None,
+            pc: [None; 4],
+            crota2: None,
+            lonpole: None,
+            sip_a: Vec::new(),
+            sip_b: Vec::new(),
             zbitpix: None,
             znaxis: None,
             znaxes: Vec::new(),
@@ -153,9 +190,8 @@ struct FitsHeader {
     bscale: f64,
     data_offset: usize, // byte offset where the pixels start (raw images)
     wcs: Option<Wcs>,
-    ctype1: Option<String>, // projection of axis 1, e.g. "RA---TAN"
-    ctype2: Option<String>, // projection of axis 2, e.g. "DEC--TAN"
     tiled: Option<Tiled>,   // Some(..) for tile-compressed images
+    wcs_error: Option<String>, // why the WCS cannot be used, if it is present but unsupported
 }
 
 fn parse_f64(s: &str) -> Option<f64> {
@@ -165,6 +201,12 @@ fn parse_f64(s: &str) -> Option<f64> {
 
 fn unquote(s: &str) -> String {
     s.trim_matches('\'').trim().to_string()
+}
+
+/// "2_1" -> (2, 1), the powers of a SIP term (A_2_1).
+fn parse_pq(s: &str) -> Option<(i32, i32)> {
+    let (p, q) = s.split_once('_')?;
+    Some((p.parse().ok()?, q.parse().ok()?))
 }
 
 fn set_indexed<T: Clone>(v: &mut Vec<T>, i: usize, value: T, fill: T) {
@@ -217,6 +259,14 @@ fn read_header(mmap: &[u8], offset: usize) -> PyResult<(RawHeader, usize)> {
                     "CD1_2" => h.cd1_2 = parse_f64(value_str),
                     "CD2_1" => h.cd2_1 = parse_f64(value_str),
                     "CD2_2" => h.cd2_2 = parse_f64(value_str),
+                    "CDELT1" => h.cdelt1 = parse_f64(value_str),
+                    "CDELT2" => h.cdelt2 = parse_f64(value_str),
+                    "PC1_1" => h.pc[0] = parse_f64(value_str),
+                    "PC1_2" => h.pc[1] = parse_f64(value_str),
+                    "PC2_1" => h.pc[2] = parse_f64(value_str),
+                    "PC2_2" => h.pc[3] = parse_f64(value_str),
+                    "CROTA2" => h.crota2 = parse_f64(value_str),
+                    "LONPOLE" => h.lonpole = parse_f64(value_str),
                     "CTYPE1" => h.ctype1 = Some(unquote(value_str)),
                     "CTYPE2" => h.ctype2 = Some(unquote(value_str)),
                     "ZBITPIX" => h.zbitpix = value_str.parse::<i32>().ok(),
@@ -266,6 +316,14 @@ fn read_header(mmap: &[u8], offset: usize) -> PyResult<(RawHeader, usize)> {
                                 if i < N_PV {
                                     h.pv2[i] = parse_f64(value_str);
                                 }
+                            }
+                        } else if let Some(rest) = keyword.strip_prefix("A_") {
+                            if let (Some((p, q)), Some(v)) = (parse_pq(rest), parse_f64(value_str)) {
+                                h.sip_a.push((p, q, v));
+                            }
+                        } else if let Some(rest) = keyword.strip_prefix("B_") {
+                            if let (Some((p, q)), Some(v)) = (parse_pq(rest), parse_f64(value_str)) {
+                                h.sip_b.push((p, q, v));
                             }
                         }
                     }
@@ -372,39 +430,92 @@ fn image_hdu_summary(hdus: &[Hdu]) -> String {
     format!("it contains: {}{}", shown.join("; "), more)
 }
 
-fn build_wcs(h: &RawHeader) -> Option<Wcs> {
-    match (h.crval1, h.crval2, h.crpix1, h.crpix2, h.cd1_1, h.cd2_2) {
-        (Some(crval1), Some(crval2), Some(crpix1), Some(crpix2), Some(cd1_1), Some(cd2_2)) => {
-            let is_tpv = h.ctype1.as_deref() == Some("RA---TPV") && h.ctype2.as_deref() == Some("DEC--TPV");
-            let tpv = if is_tpv {
-                let coeffs = |pv: &Vec<Option<f64>>| {
-                    let mut a = [0.0f64; N_PV];
-                    a[1] = 1.0; // PVi_1 defaults to 1 (identity) when absent
-                    for (k, v) in pv.iter().enumerate() {
-                        if let Some(v) = v {
-                            a[k] = *v;
-                        }
-                    }
-                    a
-                };
-                Some(Tpv { pv1: coeffs(&h.pv1), pv2: coeffs(&h.pv2) })
-            } else {
-                None
-            };
-            Some(Wcs {
-                crval1,
-                crval2,
-                crpix1,
-                crpix2,
-                cd1_1,
-                cd1_2: h.cd1_2.unwrap_or(0.0),
-                cd2_1: h.cd2_1.unwrap_or(0.0),
-                cd2_2,
-                tpv,
-            })
-        }
-        _ => None,
+/// The 2x2 linear matrix (degrees/pixel) of a header: the CD matrix if there
+/// is one, otherwise CDELT combined with PC (or with the legacy CROTA2).
+fn linear_matrix(h: &RawHeader) -> Option<[f64; 4]> {
+    if let (Some(cd11), Some(cd22)) = (h.cd1_1, h.cd2_2) {
+        return Some([cd11, h.cd1_2.unwrap_or(0.0), h.cd2_1.unwrap_or(0.0), cd22]);
     }
+    let has_pc = h.pc.iter().any(|v| v.is_some());
+    if h.cdelt1.is_none() && h.cdelt2.is_none() && !has_pc {
+        return None;
+    }
+    let (c1, c2) = (h.cdelt1.unwrap_or(1.0), h.cdelt2.unwrap_or(1.0));
+    if !has_pc {
+        if let Some(rho) = h.crota2 {
+            // legacy AIPS rotation convention
+            let (s, c) = rho.to_radians().sin_cos();
+            return Some([c1 * c, -c2 * s, c1 * s, c2 * c]);
+        }
+    }
+    let pc = [h.pc[0].unwrap_or(1.0), h.pc[1].unwrap_or(0.0), h.pc[2].unwrap_or(0.0), h.pc[3].unwrap_or(1.0)];
+    Some([c1 * pc[0], c1 * pc[1], c2 * pc[2], c2 * pc[3]])
+}
+
+/// Recognises the projection named by CTYPE1/CTYPE2 ("RA---TAN", "DEC--TAN",
+/// "RA---TAN-SIP", "RA---TPV"...). Returns (projection, tpv, sip).
+fn parse_projection(h: &RawHeader) -> Result<(Proj, bool, bool), String> {
+    let c1 = h.ctype1.as_deref();
+    let c2 = h.ctype2.as_deref();
+    let split = |c: Option<&str>, prefix: &str| -> Option<(String, String)> {
+        let rest = c?.strip_prefix(prefix)?;
+        Some((rest.get(0..3)?.to_string(), rest.get(3..)?.to_string()))
+    };
+    if let (Some((code1, suf1)), Some((code2, suf2))) = (split(c1, "RA---"), split(c2, "DEC--")) {
+        if code1 == code2 && suf1 == suf2 {
+            match (code1.as_str(), suf1.as_str()) {
+                ("TAN", "") => return Ok((Proj::Tan, false, false)),
+                ("TAN", "-SIP") => return Ok((Proj::Tan, false, true)),
+                ("TPV", "") => return Ok((Proj::Tan, true, false)),
+                ("SIN", "") => return Ok((Proj::Sin, false, false)),
+                ("ARC", "") => return Ok((Proj::Arc, false, false)),
+                ("STG", "") => return Ok((Proj::Stg, false, false)),
+                ("ZEA", "") => return Ok((Proj::Zea, false, false)),
+                ("ZPN", "") => return Ok((Proj::Zpn, false, false)),
+                _ => {}
+            }
+        }
+    }
+    Err(format!(
+        "unsupported WCS projection: found CTYPE1/CTYPE2 = {}/{}; supported are RA---TAN/DEC--TAN (also with -SIP \
+         distortion), RA---TPV/DEC--TPV and the zenithal projections SIN, ARC, STG, ZEA and ZPN \
+         (other projections, for example cylindrical or all-sky ones, are not supported)",
+        c1.unwrap_or("<missing>"),
+        c2.unwrap_or("<missing>")
+    ))
+}
+
+/// Builds the WCS of a header. Returns (wcs, problem): `wcs` is `None` when the
+/// astrometry keywords are missing or the projection is not supported, and in
+/// the second case `problem` says why.
+fn build_wcs(h: &RawHeader) -> (Option<Wcs>, Option<String>) {
+    let (crval1, crval2, crpix1, crpix2, cd) = match (h.crval1, h.crval2, h.crpix1, h.crpix2, linear_matrix(h)) {
+        (Some(a), Some(b), Some(c), Some(d), Some(m)) => (a, b, c, d, m),
+        _ => return (None, None),
+    };
+    let (proj, is_tpv, is_sip) = match parse_projection(h) {
+        Ok(v) => v,
+        Err(msg) => return (None, Some(msg)),
+    };
+    let coeffs = |pv: &Vec<Option<f64>>| {
+        let mut a = [0.0f64; N_PV];
+        a[1] = 1.0; // PVi_1 defaults to 1 (identity) when absent
+        for (k, v) in pv.iter().enumerate() {
+            if let Some(v) = v {
+                a[k] = *v;
+            }
+        }
+        a
+    };
+    let tpv = if is_tpv { Some(Tpv { pv1: coeffs(&h.pv1), pv2: coeffs(&h.pv2) }) } else { None };
+    let sip = if is_sip { Some(Sip { a: h.sip_a.clone(), b: h.sip_b.clone() }) } else { None };
+    // Default LONPOLE for a zenithal projection (native pole = reference point):
+    // 180 degrees unless the reference point is at the celestial pole.
+    let lonpole = h.lonpole.unwrap_or(if crval2 >= 90.0 { 0.0 } else { 180.0 });
+    (
+        Some(Wcs { crval1, crval2, crpix1, crpix2, cd, proj, lonpole, zpn: coeffs(&h.pv2), tpv, sip }),
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -972,9 +1083,8 @@ fn locate_image(mmap: &[u8], sel: &Option<HduSelector>) -> PyResult<FitsHeader> 
             bzero: h.bzero,
             bscale: h.bscale,
             data_offset: 0,
-            wcs: build_wcs(h),
-            ctype1: h.ctype1.clone(),
-            ctype2: h.ctype2.clone(),
+            wcs: build_wcs(h).0,
+            wcs_error: build_wcs(h).1,
             tiled: Some(tiled),
         });
     }
@@ -1011,9 +1121,8 @@ fn locate_image(mmap: &[u8], sel: &Option<HduSelector>) -> PyResult<FitsHeader> 
         bzero: h.bzero,
         bscale: h.bscale,
         data_offset: hdu.data_offset,
-        wcs: build_wcs(h),
-        ctype1: h.ctype1.clone(),
-        ctype2: h.ctype2.clone(),
+        wcs: build_wcs(h).0,
+        wcs_error: build_wcs(h).1,
         tiled: None,
     })
 }
@@ -1478,14 +1587,18 @@ fn tpv_forward(t: &Tpv, x: f64, y: f64) -> (f64, f64) {
 /// Inverts the TPV distortion with Newton's method: finds (x, y) such that
 /// tpv_forward(x, y) = (xi, eta). Converges to ~1e-12 degree (4e-9 arcsec).
 fn tpv_invert(t: &Tpv, xi: f64, eta: f64) -> PyResult<(f64, f64)> {
+    let residual = |x: f64, y: f64| -> (f64, f64) {
+        let (fx, fy) = tpv_forward(t, x, y);
+        (fx - xi, fy - eta)
+    };
     let (mut x, mut y) = (xi, eta);
     let h = 1e-6; // finite-difference step, degrees
-    for _ in 0..50 {
-        let (fx, fy) = tpv_forward(t, x, y);
-        let (rx, ry) = (fx - xi, fy - eta);
+    for _ in 0..80 {
+        let (rx, ry) = residual(x, y);
         if rx.abs() < 1e-12 && ry.abs() < 1e-12 {
             return Ok((x, y));
         }
+        let (fx, fy) = (rx + xi, ry + eta);
         let (fx_dx, fy_dx) = tpv_forward(t, x + h, y);
         let (fx_dy, fy_dy) = tpv_forward(t, x, y + h);
         let (a, c) = ((fx_dx - fx) / h, (fy_dx - fy) / h); // d(fx,fy)/dx
@@ -1494,47 +1607,161 @@ fn tpv_invert(t: &Tpv, xi: f64, eta: f64) -> PyResult<(f64, f64)> {
         if det == 0.0 || !det.is_finite() {
             return err("TPV distortion cannot be inverted at this position (singular Jacobian)");
         }
-        x -= (d * rx - b * ry) / det;
-        y -= (-c * rx + a * ry) / det;
+        let (dx, dy) = ((d * rx - b * ry) / det, (-c * rx + a * ry) / det);
+        // Damped Newton: halve the step until the residual shrinks.
+        let norm0 = rx.hypot(ry);
+        let mut lambda = 1.0;
+        for _ in 0..40 {
+            let (r2x, r2y) = residual(x - lambda * dx, y - lambda * dy);
+            if r2x.hypot(r2y) < norm0 {
+                break;
+            }
+            lambda *= 0.5;
+        }
+        x -= lambda * dx;
+        y -= lambda * dy;
     }
     err("TPV distortion inversion did not converge")
 }
 
-/// Converts sky coordinates (RA/Dec, in degrees) to pixel coordinates (FITS
-/// 1-indexed convention) using the tangent (TAN / gnomonic) projection --
-/// the projection used by almost all modern surveys (Euclid included) --
-/// plus the TPV polynomial distortion when the header has one.
-/// SIP distortion is not handled.
-fn radec_to_pixel(ra_deg: f64, dec_deg: f64, wcs: &Wcs) -> PyResult<(f64, f64)> {
-    let ra = ra_deg.to_radians();
-    let dec = dec_deg.to_radians();
-    let ra0 = wcs.crval1.to_radians();
-    let dec0 = wcs.crval2.to_radians();
+/// Sky position -> intermediate world coordinates (x, y) in degrees, for a
+/// zenithal projection (Calabretta & Greisen 2002): rotate to native spherical
+/// coordinates (phi, theta) around the reference point, then apply the
+/// projection's R(theta).
+fn zenithal_xy(wcs: &Wcs, ra_deg: f64, dec_deg: f64) -> PyResult<(f64, f64)> {
+    let a = ra_deg.to_radians();
+    let d = dec_deg.to_radians();
+    let da = a - wcs.crval1.to_radians();
+    let (sd, cd_) = d.sin_cos();
+    let (sd0, cd0) = wcs.crval2.to_radians().sin_cos();
 
-    let cos_c = dec0.sin() * dec.sin() + dec0.cos() * dec.cos() * (ra - ra0).cos();
-    if cos_c <= 1e-9 {
-        return err("the requested sky position is not within 90 degrees of the image center (no tangent-plane projection)");
+    let sin_theta = sd * sd0 + cd_ * cd0 * da.cos();
+    let u = -cd_ * da.sin();
+    let w = sd * cd0 - cd_ * sd0 * da.cos();
+    let cos_theta = u.hypot(w);
+    let phi = wcs.lonpole.to_radians() + u.atan2(w);
+    let zeta = cos_theta.atan2(sin_theta); // 90 degrees - theta, in radians
+
+    let r = match wcs.proj {
+        Proj::Tan | Proj::Sin if sin_theta <= 1e-9 => {
+            return err("the requested sky position is not within 90 degrees of the image center (no projection)")
+        }
+        Proj::Tan => cos_theta / sin_theta,
+        Proj::Sin => cos_theta,
+        Proj::Arc => zeta,
+        Proj::Stg => {
+            if zeta > std::f64::consts::PI - 1e-9 {
+                return err("the requested sky position is opposite the image center (no stereographic projection)");
+            }
+            2.0 * (zeta / 2.0).tan()
+        }
+        Proj::Zea => 2.0 * (zeta / 2.0).sin(),
+        Proj::Zpn => wcs.zpn[..31].iter().rev().fold(0.0, |acc, &c| acc * zeta + c),
+    };
+    let r = r.to_degrees();
+    Ok((r * phi.sin(), -r * phi.cos()))
+}
+
+/// Inverts the SIP distortion with Newton's method: finds the pixel offsets
+/// (u, v) such that u + f(u, v) = U and v + g(u, v) = V.
+fn sip_invert(sip: &Sip, big_u: f64, big_v: f64) -> PyResult<(f64, f64)> {
+    let poly = |terms: &[(i32, i32, f64)], u: f64, v: f64| -> (f64, f64, f64) {
+        // value and the two partial derivatives
+        let (mut s, mut su, mut sv) = (0.0, 0.0, 0.0);
+        for &(p, q, c) in terms {
+            s += c * u.powi(p) * v.powi(q);
+            if p > 0 {
+                su += c * p as f64 * u.powi(p - 1) * v.powi(q);
+            }
+            if q > 0 {
+                sv += c * q as f64 * u.powi(p) * v.powi(q - 1);
+            }
+        }
+        (s, su, sv)
+    };
+    let residual = |u: f64, v: f64| -> (f64, f64) {
+        (u + poly(&sip.a, u, v).0 - big_u, v + poly(&sip.b, u, v).0 - big_v)
+    };
+    // First, a fixed-point iteration u = U - f(u, v): for the mild distortions of
+    // real instruments it is a contraction that converges to the root nearest
+    // to the undistorted position, which is the one we want even if the
+    // distortion polynomial folds over far from the image.
+    let (mut u, mut v) = (big_u, big_v);
+    for _ in 0..200 {
+        let (ru, rv) = residual(u, v);
+        if ru.abs() < 1e-11 && rv.abs() < 1e-11 {
+            return Ok((u, v));
+        }
+        let (nu, nv) = (big_u - poly(&sip.a, u, v).0, big_v - poly(&sip.b, u, v).0);
+        if !nu.is_finite() || !nv.is_finite() || nu.abs() > 1e7 || nv.abs() > 1e7 {
+            break; // diverging: fall back to Newton's method
+        }
+        u = nu;
+        v = nv;
     }
-    let xi = dec.cos() * (ra - ra0).sin() / cos_c; // radians
-    let eta = (dec0.cos() * dec.sin() - dec0.sin() * dec.cos() * (ra - ra0).cos()) / cos_c;
+    // Fallback: damped Newton from the undistorted position.
+    let (mut u, mut v) = (big_u, big_v);
+    for _ in 0..80 {
+        let (ru, rv) = residual(u, v);
+        if ru.abs() < 1e-11 && rv.abs() < 1e-11 {
+            return Ok((u, v));
+        }
+        let (_, fa_u, fa_v) = poly(&sip.a, u, v);
+        let (_, fb_u, fb_v) = poly(&sip.b, u, v);
+        let (j11, j12, j21, j22) = (1.0 + fa_u, fa_v, fb_u, 1.0 + fb_v);
+        let det = j11 * j22 - j12 * j21;
+        if det == 0.0 || !det.is_finite() {
+            return err("SIP distortion cannot be inverted at this position (singular Jacobian)");
+        }
+        let (du, dv) = ((j22 * ru - j12 * rv) / det, (-j21 * ru + j11 * rv) / det);
+        // Damped Newton: halve the step until the residual shrinks, so the
+        // iteration stays on the root nearest to the starting guess.
+        let norm0 = ru.hypot(rv);
+        let mut lambda = 1.0;
+        for _ in 0..40 {
+            let (nu, nv) = (u - lambda * du, v - lambda * dv);
+            let (r2u, r2v) = residual(nu, nv);
+            if r2u.hypot(r2v) < norm0 {
+                break;
+            }
+            lambda *= 0.5;
+        }
+        u -= lambda * du;
+        v -= lambda * dv;
+    }
+    err("SIP distortion inversion did not converge")
+}
 
-    let xi_deg = xi.to_degrees();
-    let eta_deg = eta.to_degrees();
+/// Converts sky coordinates (RA/Dec, in degrees) to pixel coordinates (FITS
+/// 1-indexed convention): zenithal projection (TAN, SIN, ARC, STG, ZEA, ZPN),
+/// then the TPV polynomial if the header has one, the inverse of the CD matrix
+/// and finally the SIP distortion if the header has one.
+fn radec_to_pixel(ra_deg: f64, dec_deg: f64, wcs: &Wcs) -> PyResult<(f64, f64)> {
+    let (xi, eta) = zenithal_xy(wcs, ra_deg, dec_deg)?;
 
     // With TPV, the tangent-plane coordinates above are the *distorted* ones:
     // undo the polynomial to get the intermediate world coordinates.
     let (xw, yw) = match &wcs.tpv {
-        Some(t) => tpv_invert(t, xi_deg, eta_deg)?,
-        None => (xi_deg, eta_deg),
+        Some(t) => tpv_invert(t, xi, eta)?,
+        None => (xi, eta),
     };
 
-    // Invert the 2x2 CD matrix to go from intermediate world coordinates
-    // to pixel offsets.
-    let det = wcs.cd1_1 * wcs.cd2_2 - wcs.cd1_2 * wcs.cd2_1;
-    let dx = (wcs.cd2_2 * xw - wcs.cd1_2 * yw) / det;
-    let dy = (-wcs.cd2_1 * xw + wcs.cd1_1 * yw) / det;
+    // Invert the 2x2 matrix to go from intermediate world coordinates to
+    // pixel offsets.
+    let [cd11, cd12, cd21, cd22] = wcs.cd;
+    let det = cd11 * cd22 - cd12 * cd21;
+    if det == 0.0 || !det.is_finite() {
+        return err("the WCS matrix is singular");
+    }
+    let big_u = (cd22 * xw - cd12 * yw) / det;
+    let big_v = (-cd21 * xw + cd11 * yw) / det;
 
-    Ok((wcs.crpix1 + dx, wcs.crpix2 + dy))
+    // SIP distortion applies to the pixel offsets, before the matrix.
+    let (u, v) = match &wcs.sip {
+        Some(s) => sip_invert(s, big_u, big_v)?,
+        None => (big_u, big_v),
+    };
+    Ok((wcs.crpix1 + u, wcs.crpix2 + v))
 }
 
 /// Result of a cutout extraction: the sub-image (physical values, row by
@@ -1580,24 +1807,14 @@ fn cutout_at(
     width: usize,
     height: usize,
 ) -> PyResult<(f64, f64, usize, usize, Vec<f64>)> {
-    let wcs = header
-        .wcs
-        .ok_or_else(|| PyValueError::new_err("this file has no WCS header (CRVAL/CRPIX/CD)"))?;
-
-    // Only the tangent projection (plain TAN, or TPV with its polynomial) is
-    // implemented. Anything else (SIN, ARC, TAN-SIP...) would silently give
-    // wrong positions.
-    let ct = (header.ctype1.as_deref(), header.ctype2.as_deref());
-    if ct != (Some("RA---TAN"), Some("DEC--TAN")) && ct != (Some("RA---TPV"), Some("DEC--TPV")) {
-        return err(format!(
-            "unsupported WCS projection: expected CTYPE1/CTYPE2 = RA---TAN/DEC--TAN or RA---TPV/DEC--TPV, found {}/{} \
-             (other projections and SIP distortion are not supported)",
-            ct.0.unwrap_or("<missing>"),
-            ct.1.unwrap_or("<missing>"),
-        ));
+    if let Some(msg) = &header.wcs_error {
+        return err(msg.clone());
     }
+    let wcs = header.wcs.as_ref().ok_or_else(|| {
+        PyValueError::new_err("this file has no WCS header (CRVAL, CRPIX and either a CD matrix or CDELT/PC)")
+    })?;
 
-    let (px, py) = radec_to_pixel(ra_deg, dec_deg, &wcs)?;
+    let (px, py) = radec_to_pixel(ra_deg, dec_deg, wcs)?;
     // Convert FITS 1-indexed -> 0-indexed array, then take the cutout's top-left corner.
     let cx = px - 1.0;
     let cy = py - 1.0;

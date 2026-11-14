@@ -135,8 +135,9 @@ def test_rejected_inputs(tmp):
     raises(lambda: euclid_fast.fits_stats(p), "NAXIS = 3", "2-D")
     raises(lambda: cutout(p), "NAXIS = 3")
 
-    # Projections other than TAN / TPV (used to be treated as TAN)
-    for name, ctype in (("sin.fits", ("RA---SIN", "DEC--SIN")), ("tansip.fits", ("RA---TAN-SIP", "DEC--TAN-SIP"))):
+    # Projections that are not implemented (cylindrical, all-sky...), or a mismatched pair
+    for name, ctype in (("car.fits", ("RA---CAR", "DEC--CAR")), ("ait.fits", ("RA---AIT", "DEC--AIT")),
+                        ("mixed.fits", ("RA---TAN", "DEC--SIN"))):
         h = fits.PrimaryHDU(IMG); add_wcs(h.header, ctype=ctype)
         p = write(tmp, name, fits.HDUList([h]))
         assert euclid_fast.fits_stats(p).naxis1 == 300      # stats need no WCS
@@ -148,14 +149,11 @@ def test_rejected_inputs(tmp):
     p = write(tmp, "noctype.fits", fits.HDUList([h]))
     raises(lambda: cutout(p), "unsupported WCS projection", "<missing>")
 
-    # CDELT instead of CD, and no WCS: stats ok, cutout rejected
-    for name, with_cdelt in (("cdelt.fits", True), ("nowcs.fits", False)):
-        h = fits.PrimaryHDU(IMG)
-        if with_cdelt:
-            add_wcs(h.header, cd=False)
-        p = write(tmp, name, fits.HDUList([h]))
-        assert euclid_fast.fits_stats(p).naxis2 == 200
-        raises(lambda: cutout(p), "no WCS header")
+    # No WCS at all: stats ok, cutout rejected
+    h = fits.PrimaryHDU(IMG)
+    p = write(tmp, "nowcs.fits", fits.HDUList([h]))
+    assert euclid_fast.fits_stats(p).naxis2 == 200
+    raises(lambda: cutout(p), "no WCS header")
 
     p = str(Path(tmp) / "notfits.fits"); Path(p).write_bytes(b"hello" * 1000)
     raises(lambda: euclid_fast.fits_stats(p), "no END card")
@@ -250,6 +248,89 @@ def test_compressed_images(tmp):
                               quantize_level=0.0); n += 1
 
 
+def _wcs_header(code, crval, scale, rot=0.0, form="CD", n=(400, 300), lonpole=None, suffix="", **extra):
+    import math
+    h = fits.Header()
+    h["CTYPE1"], h["CTYPE2"] = f"RA---{code}{suffix}", f"DEC--{code}{suffix}"
+    h["CRVAL1"], h["CRVAL2"] = crval
+    h["CRPIX1"], h["CRPIX2"] = n[0] / 2 + 0.3, n[1] / 2 - 0.7
+    c, s = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+    if form == "CD":
+        h["CD1_1"], h["CD1_2"], h["CD2_1"], h["CD2_2"] = -scale * c, scale * s, scale * s, scale * c
+    elif form == "PC":
+        h["CDELT1"], h["CDELT2"] = -scale, scale
+        h["PC1_1"], h["PC1_2"], h["PC2_1"], h["PC2_2"] = c, -s, s, c
+    elif form == "CDELT":
+        h["CDELT1"], h["CDELT2"] = -scale, scale
+    elif form == "CROTA":
+        h["CDELT1"], h["CDELT2"] = -scale, scale
+        h["CROTA2"] = rot
+    if lonpole is not None:
+        h["LONPOLE"] = lonpole
+    for k, v in extra.items():
+        h[k] = v
+    return h
+
+
+def _check_wcs_roundtrip(tmp, name, header, n=(400, 300), npos=40, margin=10, tol=1e-6, seed=0):
+    """Sky positions computed by astropy/wcslib for known pixels must be turned back
+    into those pixels by euclid_fast."""
+    p = write(tmp, name, fits.HDUList([fits.PrimaryHDU(np.zeros((n[1], n[0]), np.float32), header=header)]))
+    wcs = WCS(fits.getheader(p))
+    rng = np.random.default_rng(seed)
+    xs, ys = rng.uniform(margin, n[0] - margin, npos), rng.uniform(margin, n[1] - margin, npos)
+    ras, decs = wcs.all_pix2world(xs, ys, 1)
+    got = euclid_fast.extract_cutouts(p, list(ras), list(decs), 3, 3)
+    worst = max(max(abs(c.pixel_x_center - x), abs(c.pixel_y_center - y)) for c, x, y in zip(got, xs, ys))
+    assert worst < tol, f"{name}: euclid_fast disagrees with wcslib by up to {worst} px"
+
+
+def test_wcs_matches_astropy(tmp):
+    import itertools
+    rng = np.random.default_rng(21)
+    k = 0
+    # zenithal projections, several fields of view, near the poles and across RA = 0
+    crvals = [(150.0, 2.0), (359.95, -45.0), (10.0, 88.0), (200.0, -89.3)]
+    for code in ("TAN", "SIN", "ARC", "STG", "ZEA"):
+        for crval, scale in itertools.product(crvals, (1e-4, 5e-2)):
+            _check_wcs_roundtrip(tmp, f"z{k}.fits", _wcs_header(code, crval, scale, float(rng.uniform(-180, 180))), seed=k); k += 1
+    # polynomial zenithal projection
+    _check_wcs_roundtrip(tmp, f"z{k}.fits", _wcs_header("ZPN", (120.0, 30.0), 4e-2, 20.0, PV2_1=1.0, PV2_3=-0.08, PV2_5=0.02)); k += 1
+    # the other ways of writing the linear matrix
+    for form in ("PC", "CDELT", "CROTA"):
+        for code in ("TAN", "ARC"):
+            rot = 0.0 if form == "CDELT" else float(rng.uniform(-90, 90))
+            _check_wcs_roundtrip(tmp, f"m{k}.fits", _wcs_header(code, (30.0, -70.0), 3e-3, rot, form)); k += 1
+    # explicit LONPOLE
+    for lp in (0.0, 90.0, 180.0, 233.0):
+        _check_wcs_roundtrip(tmp, f"l{k}.fits", _wcs_header("SIN", (150.0, -20.0), 2e-3, 15.0, lonpole=lp)); k += 1
+    # SIP distortion of a few pixels, several orders, CD and PC/CDELT forms
+    for order in (2, 3, 4, 5):
+        extra = {"A_ORDER": order, "B_ORDER": order}
+        for pp in range(order + 1):
+            for q in range(order + 1 - pp):
+                if pp + q >= 2:
+                    extra[f"A_{pp}_{q}"] = float(rng.normal(0, 4e-6 / 200 ** (pp + q - 2)))
+                    extra[f"B_{pp}_{q}"] = float(rng.normal(0, 4e-6 / 200 ** (pp + q - 2)))
+        for form in ("CD", "PC"):
+            _check_wcs_roundtrip(tmp, f"s{k}.fits", _wcs_header("TAN", (150.0, 2.0), 1e-4, 33.0, form, suffix="-SIP", **extra)); k += 1
+    _check_wcs_roundtrip(tmp, f"s{k}.fits", _wcs_header("TAN", (150.0, 2.0), 1e-4, 0.0, suffix="-SIP"))   # -SIP without terms
+    # real SIP headers shipped with astropy (HST, PC/CDELT form), when the package has them
+    import os
+    import astropy.wcs
+    data = os.path.join(os.path.dirname(astropy.wcs.__file__), "tests", "data")
+    for fname in ("sip.fits", "sip2.fits"):
+        path = os.path.join(data, fname)
+        if os.path.exists(path):
+            src = fits.getheader(path, 0)
+            keep = fits.Header()
+            for card in src.cards:
+                if card.keyword not in ("SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "EXTEND", "WCSAXES", "") \
+                        and not card.keyword.startswith(("COMMENT", "HISTORY")):
+                    keep.append(card)
+            _check_wcs_roundtrip(tmp, f"r{k}.fits", keep, n=(256, 256), margin=20, tol=1e-6); k += 1
+
+
 def _same_stats(a, b):
     return (a.min, a.max, a.mean, a.naxis1, a.naxis2, a.bitpix) == (b.min, b.max, b.mean, b.naxis1, b.naxis2, b.bitpix)
 
@@ -331,7 +412,8 @@ def test_batch(tmp):
 
 def test_all():
     for fn in (test_supported_primary, test_int64, test_extensions, test_unreadable_hdus,
-               test_rejected_inputs, test_tpv_matches_astropy, test_compressed_images, test_batch):
+               test_rejected_inputs, test_tpv_matches_astropy, test_wcs_matches_astropy,
+               test_compressed_images, test_batch):
         with tempfile.TemporaryDirectory() as tmp:
             fn(tmp)
             print("ok  ", fn.__name__)

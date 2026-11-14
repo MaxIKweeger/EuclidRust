@@ -61,7 +61,7 @@ contains.
 | An image HDU | 2-D (`NAXIS = 2`). The primary HDU by default, or any image extension through `hdu=` (0-based index or `EXTNAME`) |
 | Compression | None, or FITS tile compression with `RICE_1`, `GZIP_1` or `GZIP_2` (the `.fits.fz` format written by `fpack` and by astropy's `CompImageHDU`), including quantized floating-point images (`NO_DITHER`, `SUBTRACTIVE_DITHER_1`, `SUBTRACTIVE_DITHER_2`). A compressed image always lives in an extension, so pass `hdu=1` (or its name) |
 | Pixel type (`BITPIX`) | `8`, `16`, `32`, `64` (integers), `-32`, `-64` (floating point). `BZERO` / `BSCALE` are applied, so unsigned 16-bit raw data (`BZERO = 32768`) works. 64-bit integers are converted to `float64`, which is exact up to 2^53 (about 9 × 10^15) |
-| WCS, only needed for cutouts | `CTYPE1/2 = RA---TAN / DEC--TAN`, **or** `RA---TPV / DEC--TPV` (the tangent projection plus the polynomial distortion `PV1_m` / `PV2_m` used by the Euclid VIS pipeline), together with `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix (`CD1_1`, `CD2_2`, and `CD1_2`, `CD2_1` if rotated). `fits_stats` needs no WCS |
+| WCS, only needed for cutouts | `CTYPE1/2` = `RA---xxx` / `DEC--xxx` with `xxx` one of `TAN`, `SIN`, `ARC`, `STG`, `ZEA`, `ZPN` (the zenithal projections), `TAN-SIP` (tangent plus the SIP polynomial distortion) or `TPV` (tangent plus the `PV1_m` / `PV2_m` polynomials used by the Euclid VIS pipeline), together with `CRVAL1/2`, `CRPIX1/2` and a linear matrix written as `CD` (`CD1_1`, `CD1_2`, `CD2_1`, `CD2_2`), as `CDELT1/2` with an optional `PC` matrix, or as `CDELT1/2` with the legacy `CROTA2`. `LONPOLE` is honoured. `fits_stats` needs no WCS |
 
 **Not supported.** Anything else is rejected with a `ValueError` that says
 why, rather than being read wrongly (these cases are covered by
@@ -73,8 +73,8 @@ why, rather than being read wrongly (these cases are covered by
 | An extension that is a table (catalogue, spectrum...) | `HDU 1 is a BINTABLE table, not an image` |
 | 3-D cubes (`NAXIS = 3`) | `NAXIS = 3 is not supported ...: only 2-D images are handled` |
 | Not a FITS file | `truncated file: no END card found` |
-| A projection other than TAN / TPV (`SIN`, `ARC`...), SIP distortion (`CTYPE` ending in `-SIP`), or a missing `CTYPE` | Cutouts raise `unsupported WCS projection: expected CTYPE1/CTYPE2 = RA---TAN/DEC--TAN or RA---TPV/DEC--TPV, found ...` (`fits_stats` still works) |
-| WCS written with `CDELT` (+`PC`) instead of a `CD` matrix, or no WCS at all | Cutouts raise `this file has no WCS header` (`fits_stats` still works) |
+| A projection that is not implemented (cylindrical or all-sky ones such as `CAR`, `AIT`, `MOL`, `HPX`...), a mismatched `CTYPE` pair, or a missing `CTYPE` | Cutouts raise `unsupported WCS projection: found CTYPE1/CTYPE2 = ...; supported are RA---TAN/DEC--TAN (also with -SIP distortion), RA---TPV/DEC--TPV and the zenithal projections SIN, ARC, STG, ZEA and ZPN ...` (`fits_stats` still works) |
+| No WCS at all (no `CRVAL` / `CRPIX` / matrix keywords) | Cutouts raise `this file has no WCS header (CRVAL, CRPIX and either a CD matrix or CDELT/PC)` (`fits_stats` still works) |
 
 If you forget `hdu=` on a file whose primary HDU is empty, the error lists
 the image HDUs it found and tells you what to pass, for example
@@ -115,12 +115,12 @@ from astropy.io import fits
 h = fits.getheader("file.fits", 1)          # 0 = primary HDU, 1 = first extension...
 print("NAXIS", h["NAXIS"], "| BITPIX", h["BITPIX"])
 print("CTYPE", h.get("CTYPE1"), h.get("CTYPE2"))
-print("CD matrix present:", "CD1_1" in h and "CD2_2" in h)
+print("linear matrix keywords:", [k for k in ("CD1_1", "CDELT1", "PC1_1", "CROTA2") if k in h])
 ```
 
-You want `NAXIS 2`, a `BITPIX` from the table above, `CTYPE` `RA---TAN
-DEC--TAN` or `RA---TPV DEC--TPV`, and `CD matrix present: True` (the last two
-only matter for cutouts).
+You want `NAXIS 2`, a `BITPIX` from the table above and, for cutouts, a `CTYPE`
+pair from the projection list above and some linear-matrix keywords (`CD1_1`,
+or `CDELT1`).
 
 ## How Python and Rust fit together (PyO3)
 
@@ -372,8 +372,9 @@ parallel, not from batching.
 `tests/test_input_validation.py` builds small FITS files with astropy and
 checks that supported files work (primary HDU, extensions, `BITPIX` 16 and
 64, `BZERO`/`BSCALE`), that unsupported ones are rejected with a clear error,
-that the TPV distortion agrees with astropy/wcslib on a strongly distorted
-synthetic header, and that tile-compressed images (`RICE_1`, `GZIP_1`,
+that every supported projection, matrix form, the TPV distortion and the SIP
+distortion (including real SIP headers from astropy's own test data) agree with
+astropy/wcslib, and that tile-compressed images (`RICE_1`, `GZIP_1`,
 `GZIP_2`, quantization and dithering) decode exactly like astropy/cfitsio, and
 that the batch functions return what the single calls return. It needs no download. With `euclid_fast`
 installed and `pip install -r scripts/requirements.txt` done:
@@ -467,8 +468,8 @@ loads the file into its cache.
 | `ValueError: no HDU named '...'` / `no HDU with index ...` | Wrong `hdu` value. The message lists the available HDUs; `euclid_fast.list_hdus(path)` shows them all. |
 | `ValueError: ... tile-compressed image uses ZCMPTYPE = ...` or `... is a BINTABLE table, not an image` | That HDU uses a compression algorithm that is not implemented (only `RICE_1`, `GZIP_1`, `GZIP_2` are), or it is a table. |
 | `ValueError: NAXIS = 3 is not supported` or `no END card found` | A 3-D cube, or a file that is not FITS. Only 2-D images are handled. |
-| `ValueError: unsupported WCS projection ...` | The cutout functions implement the `RA---TAN` / `DEC--TAN` projection and the `RA---TPV` / `DEC--TPV` polynomial distortion. SIN, SIP and other WCS types are not supported yet. |
-| `ValueError: this file has no WCS header` | The cutout functions need `CRVAL1/2`, `CRPIX1/2` and the `CD` matrix in the chosen HDU. `fits_stats` still works without them. |
+| `ValueError: unsupported WCS projection ...` | The cutout functions implement the zenithal projections (`TAN`, `SIN`, `ARC`, `STG`, `ZEA`, `ZPN`), `TAN-SIP` and `TPV`. Cylindrical and all-sky projections, and WCS in other coordinate systems (galactic, ecliptic), are not supported yet. |
+| `ValueError: this file has no WCS header` | The cutout functions need `CRVAL1/2`, `CRPIX1/2` and a linear matrix (`CD`, or `CDELT` with an optional `PC`) in the chosen HDU. `fits_stats` still works without them. |
 | `ValueError: cutout outside the image` | The RA/Dec you asked for falls outside the image. Check the coordinates, and for frames make sure `hdu=` is the detector you mean (each detector covers a different patch of sky). |
 | The benchmark exits asking for `numpy`/`astropy` | Run `pip install -r scripts/requirements.txt` in the same environment. |
 
@@ -503,7 +504,7 @@ identical input and compared for numerical correctness, not just speed:
 | Function | What it computes | Notes |
 |---|---|---|
 | `fits_stats(path, hdu=None)` | Global `min` / `max` / `mean` over one image HDU (the primary one by default) | `mmap` + `rayon`, chunked reduction tuned for this workload |
-| `extract_cutout(path, ra_deg, dec_deg, width, height, hdu=None)` | Pixel-space cutout around a sky position | TAN (gnomonic) WCS, or TAN with TPV polynomial distortion; FITS 1-indexed convention |
+| `extract_cutout(path, ra_deg, dec_deg, width, height, hdu=None)` | Pixel-space cutout around a sky position | Zenithal WCS (TAN, SIN, ARC, STG, ZEA, ZPN), with TPV or SIP distortion; FITS 1-indexed convention |
 | `export_cutout_parquet(path, ra_deg, dec_deg, width, height, out_path, hdu=None)` | Same cutout, written as Parquet | One row per pixel: columns `x`, `y` (absolute pixel coords in the source image), `value` (physical value, `BZERO`/`BSCALE` applied) |
 
 ## Benchmark results
@@ -627,11 +628,7 @@ never hardcoded, so the same wheel adapts to whatever machine runs it.
   no streaming and no progress callback, so a huge list of cutouts uses
   memory proportional to its size. `hdu=` is the same for every file of a
   `fits_stats_many` call.
-- **WCS: TAN and TPV only.** Cutouts do not handle SIP distortion
-  (`TAN-SIP`) or other projections, and they require the `CD` matrix form.
-  The TPV inverse (sky to pixel) is solved iteratively and agrees with
-  astropy to ~10^-8 pixel on the real VIS frame tested, but it has only been
-  checked on that one frame and on a synthetic header.
+- **WCS coverage.** Zenithal projections (`TAN`, `SIN`, `ARC`, `STG`, `ZEA`, `ZPN`), with TPV or SIP distortion. Not supported: cylindrical and all-sky projections (`CAR`, `AIT`, `MOL`, `HPX`...), coordinate systems other than RA/Dec, and distortion given by lookup tables (as in some HST files). The sky-to-pixel inverse of TPV and SIP is iterative. It was checked against wcslib (through astropy) on over 120 synthetic headers and on real ones: the real Euclid VIS frame (TPV, 3 × 10^-8 pixel) and the real SIP headers shipped with astropy's tests, including HST/ACS (4 × 10^-9 pixel at worst). It can pick the wrong root when a SIP distortion is so strong (hundreds of pixels) that the inverse is not unique, which does not happen with real instruments.
 - **Real-data validation is small.** The benchmark numbers above come from
   a single Q1 NISP mosaic tile out of the ~35 TB Q1 release. Correctness
   (not speed) was also checked against astropy on one NISP frame, one VIS
@@ -648,7 +645,7 @@ This is the first of four planned components for Euclid-scale data
 processing, chosen first specifically because it needed no GPU/cluster
 and is the foundation the others build on:
 
-1. ✅ **FITS streaming / cutout / Parquet export** (this package). Next steps for this component, in the order I would do them: SIP distortion, then the remaining compression algorithms (`HCOMPRESS_1`, `PLIO_1`) if someone needs them.
+1. ✅ **FITS streaming / cutout / Parquet export** (this package). Next steps for this component, if someone needs them: the remaining compression algorithms (`HCOMPRESS_1`, `PLIO_1`) and the cylindrical / all-sky projections.
 2. Catalogue cross-matching at the hundred-million-to-billion-object
    scale (HEALPix / spherical KD-tree indexing, memory-mapped for
    datasets larger than available RAM).
